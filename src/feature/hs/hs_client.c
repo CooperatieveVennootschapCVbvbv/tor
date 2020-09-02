@@ -16,6 +16,7 @@
 #include "core/or/circuitlist.h"
 #include "core/or/circuituse.h"
 #include "core/or/connection_edge.h"
+#include "core/or/extendinfo.h"
 #include "core/or/reasons.h"
 #include "feature/client/circpathbias.h"
 #include "feature/dirclient/dirclient.h"
@@ -704,8 +705,11 @@ send_introduce1(origin_circuit_t *intro_circ,
 }
 
 /** Using the introduction circuit circ, setup the authentication key of the
- * intro point this circuit has extended to. */
-static void
+ * intro point this circuit has extended to.
+ *
+ * Return 0 if everything went well, otherwise return -1 in the case of errors.
+ */
+static int
 setup_intro_circ_auth_key(origin_circuit_t *circ)
 {
   const hs_descriptor_t *desc;
@@ -719,27 +723,28 @@ setup_intro_circ_auth_key(origin_circuit_t *circ)
      * and the client descriptor cache that gets purged (NEWNYM) or the
      * cleaned up because it expired. Mark the circuit for close so a new
      * descriptor fetch can occur. */
-    circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
-    goto end;
+    goto err;
   }
 
   /* We will go over every intro point and try to find which one is linked to
    * that circuit. Those lists are small so it's not that expensive. */
   ip = find_desc_intro_point_by_legacy_id(
                        circ->build_state->chosen_exit->identity_digest, desc);
-  if (ip) {
-    /* We got it, copy its authentication key to the identifier. */
-    ed25519_pubkey_copy(&circ->hs_ident->intro_auth_pk,
-                        &ip->auth_key_cert->signed_key);
-    goto end;
+  if (!ip) {
+    /* Reaching this point means we didn't find any intro point for this
+     * circuit which is not supposed to happen. */
+    log_info(LD_REND,"Could not match opened intro circuit with intro point.");
+    goto err;
   }
 
-  /* Reaching this point means we didn't find any intro point for this circuit
-   * which is not supposed to happen. */
-  tor_assert_nonfatal_unreached();
+  /* We got it, copy its authentication key to the identifier. */
+  ed25519_pubkey_copy(&circ->hs_ident->intro_auth_pk,
+                      &ip->auth_key_cert->signed_key);
+  return 0;
 
- end:
-  return;
+ err:
+  circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_REASON_INTERNAL);
+  return -1;
 }
 
 /** Called when an introduction circuit has opened. */
@@ -754,7 +759,9 @@ client_intro_circ_has_opened(origin_circuit_t *circ)
   /* This is an introduction circuit so we'll attach the correct
    * authentication key to the circuit identifier so it can be identified
    * properly later on. */
-  setup_intro_circ_auth_key(circ);
+  if (setup_intro_circ_auth_key(circ) < 0) {
+    return;
+  }
 
   connection_ap_attach_pending(1);
 }
@@ -772,10 +779,16 @@ client_rendezvous_circ_has_opened(origin_circuit_t *circ)
    * the v3 rendezvous protocol */
   if (rp_ei) {
     const node_t *rp_node = node_get_by_id(rp_ei->identity_digest);
-    if (rp_node) {
-      if (BUG(!node_supports_v3_rendezvous_point(rp_node))) {
-        return;
-      }
+    if (rp_node && !node_supports_v3_rendezvous_point(rp_node)) {
+      /* Even tho we checked that this node supported v3 when we created the
+         rendezvous circuit, there is a chance that we might think it does
+         not support v3 anymore. This might happen if we got a new consensus
+         in the meanwhile, where the relay is still listed but its listed
+         descriptor digest has changed and hence we can't access its 'ri' or
+         'md'. */
+      log_info(LD_REND, "Rendezvous node %s did not support v3 after circuit "
+               "has opened.", safe_str_client(extend_info_describe(rp_ei)));
+      return;
     }
   }
 
@@ -1059,8 +1072,10 @@ close_or_reextend_intro_circ(origin_circuit_t *intro_circ)
   tor_assert(intro_circ);
 
   desc = hs_cache_lookup_as_client(&intro_circ->hs_ident->identity_pk);
-  if (BUG(desc == NULL)) {
-    /* We can't continue without a descriptor. */
+  if (desc == NULL) {
+    /* We can't continue without a descriptor. This is possible if the cache
+     * was cleaned up between the intro point established and the reception of
+     * the introduce ack. */
     goto close;
   }
   /* We still have the descriptor, great! Let's try to see if we can
@@ -1545,9 +1560,9 @@ client_dir_fetch_unexpected(dir_connection_t *dir_conn, const char *reason,
 
   log_warn(LD_REND, "Fetching v3 hidden service descriptor failed: "
                     "http status %d (%s) response unexpected from HSDir "
-                    "server '%s:%d'. Retrying at another directory.",
-           status_code, escaped(reason), TO_CONN(dir_conn)->address,
-           TO_CONN(dir_conn)->port);
+                    "server %s'. Retrying at another directory.",
+           status_code, escaped(reason),
+           connection_describe_peer(TO_CONN(dir_conn)));
   /* Fire control port FAILED event. */
   hs_control_desc_event_failed(dir_conn->hs_ident, dir_conn->identity_digest,
                                "UNEXPECTED");
@@ -2153,6 +2168,8 @@ client_service_authorization_free_(hs_client_service_authorization_t *auth)
   if (!auth) {
     return;
   }
+
+  tor_free(auth->client_name);
 
   memwipe(auth, 0, sizeof(*auth));
   tor_free(auth);

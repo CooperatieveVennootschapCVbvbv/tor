@@ -141,7 +141,7 @@ router_pick_dirserver_generic(smartlist_t *sourcelist,
 #define RETRY_ALTERNATE_IP_VERSION(retry_label)                               \
   STMT_BEGIN                                                                  \
     if (result == NULL && try_ip_pref && options->ClientUseIPv4               \
-        && fascist_firewall_use_ipv6(options) && !server_mode(options)        \
+        && reachable_addr_use_ipv6(options) && !server_mode(options)        \
         && !n_busy) {                                                         \
       n_excluded = 0;                                                         \
       n_busy = 0;                                                             \
@@ -212,18 +212,20 @@ router_picked_poor_directory_log(const routerstatus_t *rs)
     log_debug(LD_DIR, "Wanted to make an outgoing directory connection, but "
               "we couldn't find a directory that fit our criteria. "
               "Perhaps we will succeed next time with less strict criteria.");
-  } else if (!fascist_firewall_allows_rs(rs, FIREWALL_OR_CONNECTION, 1)
-             && !fascist_firewall_allows_rs(rs, FIREWALL_DIR_CONNECTION, 1)
+  } else if (!reachable_addr_allows_rs(rs, FIREWALL_OR_CONNECTION, 1)
+             && !reachable_addr_allows_rs(rs, FIREWALL_DIR_CONNECTION, 1)
              ) {
     /* This is rare, and might be interesting to users trying to diagnose
      * connection issues on dual-stack machines. */
+    char *ipv4_str = tor_addr_to_str_dup(&rs->ipv4_addr);
     log_info(LD_DIR, "Selected a directory %s with non-preferred OR and Dir "
              "addresses for launching an outgoing connection: "
              "IPv4 %s OR %d Dir %d IPv6 %s OR %d Dir %d",
              routerstatus_describe(rs),
-             fmt_addr32(rs->addr), rs->or_port,
-             rs->dir_port, fmt_addr(&rs->ipv6_addr),
-             rs->ipv6_orport, rs->dir_port);
+             ipv4_str, rs->ipv4_orport,
+             rs->ipv4_dirport, fmt_addr(&rs->ipv6_addr),
+             rs->ipv6_orport, rs->ipv4_dirport);
+    tor_free(ipv4_str);
   }
 }
 
@@ -266,7 +268,7 @@ router_is_already_dir_fetching(const tor_addr_port_t *ap, int serverdesc,
  * If so, return 1, if not, return 0.
  */
 static int
-router_is_already_dir_fetching_(uint32_t ipv4_addr,
+router_is_already_dir_fetching_(const tor_addr_t *ipv4_addr,
                                 const tor_addr_t *ipv6_addr,
                                 uint16_t dir_port,
                                 int serverdesc,
@@ -275,7 +277,7 @@ router_is_already_dir_fetching_(uint32_t ipv4_addr,
   tor_addr_port_t ipv4_dir_ap, ipv6_dir_ap;
 
   /* Assume IPv6 DirPort is the same as IPv4 DirPort */
-  tor_addr_from_ipv4h(&ipv4_dir_ap.addr, ipv4_addr);
+  tor_addr_copy(&ipv4_dir_ap.addr, ipv4_addr);
   ipv4_dir_ap.port = dir_port;
   tor_addr_copy(&ipv6_dir_ap.addr, ipv6_addr);
   ipv6_dir_ap.port = dir_port;
@@ -352,9 +354,9 @@ router_pick_directory_server_impl(dirinfo_type_t type, int flags,
       continue;
     }
 
-    if (router_is_already_dir_fetching_(status->addr,
+    if (router_is_already_dir_fetching_(&status->ipv4_addr,
                                         &status->ipv6_addr,
-                                        status->dir_port,
+                                        status->ipv4_dirport,
                                         no_serverdesc_fetching,
                                         no_microdesc_fetching)) {
       ++n_busy;
@@ -372,12 +374,12 @@ router_pick_directory_server_impl(dirinfo_type_t type, int flags,
      * we try routers that only have one address both times.)
      */
     if (!fascistfirewall || skip_or_fw ||
-        fascist_firewall_allows_node(node, FIREWALL_OR_CONNECTION,
+        reachable_addr_allows_node(node, FIREWALL_OR_CONNECTION,
                                      try_ip_pref))
       smartlist_add(is_trusted ? trusted_tunnel :
                     is_overloaded ? overloaded_tunnel : tunnel, (void*)node);
     else if (!must_have_or && (skip_dir_fw ||
-             fascist_firewall_allows_node(node, FIREWALL_DIR_CONNECTION,
+             reachable_addr_allows_node(node, FIREWALL_DIR_CONNECTION,
                                           try_ip_pref)))
       smartlist_add(is_trusted ? trusted_direct :
                     is_overloaded ? overloaded_direct : direct, (void*)node);
@@ -1143,9 +1145,9 @@ router_pick_trusteddirserver_impl(const smartlist_t *sourcelist,
         continue;
       }
 
-      if (router_is_already_dir_fetching_(d->addr,
+      if (router_is_already_dir_fetching_(&d->ipv4_addr,
                                           &d->ipv6_addr,
-                                          d->dir_port,
+                                          d->ipv4_dirport,
                                           no_serverdesc_fetching,
                                           no_microdesc_fetching)) {
         ++n_busy;
@@ -1160,11 +1162,11 @@ router_pick_trusteddirserver_impl(const smartlist_t *sourcelist,
        * we try routers that only have one address both times.)
        */
       if (!fascistfirewall || skip_or_fw ||
-          fascist_firewall_allows_dir_server(d, FIREWALL_OR_CONNECTION,
+          reachable_addr_allows_dir_server(d, FIREWALL_OR_CONNECTION,
                                              try_ip_pref))
         smartlist_add(is_overloaded ? overloaded_tunnel : tunnel, (void*)d);
       else if (!must_have_or && (skip_dir_fw ||
-               fascist_firewall_allows_dir_server(d, FIREWALL_DIR_CONNECTION,
+               reachable_addr_allows_dir_server(d, FIREWALL_DIR_CONNECTION,
                                                   try_ip_pref)))
         smartlist_add(is_overloaded ? overloaded_direct : direct, (void*)d);
     }

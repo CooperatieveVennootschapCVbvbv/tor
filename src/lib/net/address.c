@@ -764,6 +764,15 @@ tor_addr_is_v4(const tor_addr_t *addr)
   return 0; /* Not IPv4 - unknown family or a full-blood IPv6 address */
 }
 
+/** Determine whether an address <b>addr</b> is an IPv6 (AF_INET6). Return
+ * true if so else false. */
+int
+tor_addr_is_v6(const tor_addr_t *addr)
+{
+  tor_assert(addr);
+  return (tor_addr_family(addr) == AF_INET6);
+}
+
 /** Determine whether an address <b>addr</b> is null, either all zeroes or
  *  belonging to family AF_UNSPEC.
  */
@@ -2103,6 +2112,18 @@ tor_addr_port_eq(const tor_addr_port_t *a,
                  const tor_addr_port_t *b)
 {
   return tor_addr_eq(&a->addr, &b->addr) && a->port == b->port;
+}
+
+/**
+ * Copy a tor_addr_port_t from @a source to @a dest.
+ **/
+void
+tor_addr_port_copy(tor_addr_port_t *dest,
+                   const tor_addr_port_t *source)
+{
+  tor_assert(dest);
+  tor_assert(source);
+  memcpy(dest, source, sizeof(tor_addr_port_t));
 }
 
 /** Return true if <b>string</b> represents a valid IPv4 adddress in

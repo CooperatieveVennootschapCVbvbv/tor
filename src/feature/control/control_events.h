@@ -36,7 +36,8 @@ typedef enum stream_status_event_t {
   STREAM_EVENT_NEW          = 5,
   STREAM_EVENT_NEW_RESOLVE  = 6,
   STREAM_EVENT_FAILED_RETRIABLE = 7,
-  STREAM_EVENT_REMAP        = 8
+  STREAM_EVENT_REMAP        = 8,
+  STREAM_EVENT_CONTROLLER_WAIT = 9
 } stream_status_event_t;
 
 /** Used to indicate the type of a buildtime event */
@@ -225,6 +226,8 @@ void control_event_hs_descriptor_content(const char *onion_address,
                                          const char *content);
 void cbt_control_event_buildtimeout_set(const circuit_build_times_t *cbt,
                                         buildtimeout_set_event_t type);
+
+int control_event_enter_controller_wait(void);
 
 void control_events_free_all(void);
 

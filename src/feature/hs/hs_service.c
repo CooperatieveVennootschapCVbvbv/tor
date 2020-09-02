@@ -16,6 +16,7 @@
 #include "core/or/circuitbuild.h"
 #include "core/or/circuitlist.h"
 #include "core/or/circuituse.h"
+#include "core/or/extendinfo.h"
 #include "core/or/relay.h"
 #include "feature/client/circpathbias.h"
 #include "feature/dirclient/dirclient.h"
@@ -989,7 +990,7 @@ write_address_to_file(const hs_service_t *service, const char *fname_)
   tor_asprintf(&addr_buf, "%s.%s\n", service->onion_address, address_tld);
   /* Notice here that we use the given "fname_". */
   fname = hs_path_from_filename(service->config.directory_path, fname_);
-  if (write_str_to_file(fname, addr_buf, 0) < 0) {
+  if (write_str_to_file_if_not_equal(fname, addr_buf)) {
     log_warn(LD_REND, "Could not write onion address to hostname file %s",
              escaped(fname));
     goto end;
@@ -2873,6 +2874,9 @@ upload_descriptor_to_hsdir(const hs_service_t *service,
                                           hsdir->hsdir_index.store_first;
     char *blinded_pubkey_log_str =
       tor_strdup(hex_str((char*)&desc->blinded_kp.pubkey.pubkey, 32));
+    /* This log message is used by Chutney as part of its bootstrap
+     * detection mechanism. Please don't change without first checking
+     * Chutney. */
     log_info(LD_REND, "Service %s %s descriptor of revision %" PRIu64
                       " initiated upload request to %s with index %s (%s)",
              safe_str_client(service->onion_address),
@@ -3900,7 +3904,7 @@ hs_service_exports_circuit_id(const ed25519_public_key_t *pk)
 
 /** Add to file_list every filename used by a configured hidden service, and to
  * dir_list every directory path used by a configured hidden service. This is
- * used by the sandbox subsystem to whitelist those. */
+ * used by the sandbox subsystem to allowlist those. */
 void
 hs_service_lists_fnames_for_sandbox(smartlist_t *file_list,
                                     smartlist_t *dir_list)

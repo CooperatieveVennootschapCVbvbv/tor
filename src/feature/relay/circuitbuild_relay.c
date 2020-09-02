@@ -33,6 +33,7 @@
 #include "core/or/channel.h"
 #include "core/or/circuitbuild.h"
 #include "core/or/circuitlist.h"
+#include "core/or/extendinfo.h"
 #include "core/or/onion.h"
 #include "core/or/relay.h"
 
@@ -400,11 +401,7 @@ circuit_open_connection_for_extend(const struct extend_cell_t *ec,
 
   if (should_launch) {
     /* we should try to open a connection */
-    channel_t *n_chan = channel_connect_for_circuit(
-                                                &circ->n_hop->addr,
-                                                circ->n_hop->port,
-                                                circ->n_hop->identity_digest,
-                                                &circ->n_hop->ed_identity);
+    channel_t *n_chan = channel_connect_for_circuit(circ->n_hop);
     if (!n_chan) {
       log_info(LD_CIRC,"Launching n_chan failed. Closing circuit.");
       circuit_mark_for_close(circ, END_CIRC_REASON_CONNECTFAILED);
@@ -504,7 +501,7 @@ circuit_extend(struct cell_t *cell, struct circuit_t *circ)
     circ->n_chan = n_chan;
     log_debug(LD_CIRC,
               "n_chan is %s.",
-              channel_get_canonical_remote_descr(n_chan));
+              channel_describe_peer(n_chan));
 
     if (circuit_deliver_create_cell(circ, &ec.create_cell, 1) < 0)
       return -1;
@@ -591,13 +588,23 @@ onionskin_answer(struct or_circuit_t *circ,
   if ((!channel_is_local(circ->p_chan)
        || get_options()->ExtendAllowPrivateAddresses)
       && !channel_is_outgoing(circ->p_chan)) {
-    /* record that we could process create cells from a non-local conn
-     * that we didn't initiate; presumably this means that create cells
-     * can reach us too. */
-    tor_addr_t remote_addr;
-    if (channel_get_addr_if_possible(circ->p_chan, &remote_addr)) {
-      int family = tor_addr_family(&remote_addr);
-      router_orport_found_reachable(family);
+    /* Okay, it's a create cell from a non-local connection
+     * that we didn't initiate. Presumably this means that create cells
+     * can reach us too. But what address can they reach us on? */
+    const tor_addr_t *my_supposed_addr = &circ->p_chan->addr_according_to_peer;
+    if (router_addr_is_my_published_addr(my_supposed_addr)) {
+      /* Great, this create cell came on connection where the peer says
+       * that the our address is an address we're actually advertising!
+       * That should mean that we're reachable.  But before we finally
+       * declare ourselves reachable, make sure that the address listed
+       * by the peer is the same family as the peer is actually using.
+       */
+      tor_addr_t remote_addr;
+      int family = tor_addr_family(my_supposed_addr);
+      if (channel_get_addr_if_possible(circ->p_chan, &remote_addr) &&
+          tor_addr_family(&remote_addr) == family) {
+        router_orport_found_reachable(family);
+      }
     }
   }
 

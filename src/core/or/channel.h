@@ -236,6 +236,9 @@ struct channel_t {
   /** The handle to this channel (to free on canceled timers) */
   struct channel_handle_t *timer_handle;
 
+  /** If not UNSPEC, the address that the peer says we have. */
+  tor_addr_t addr_according_to_peer;
+
   /**
    * These two fields specify the minimum and maximum negotiated timeout
    * values for inactivity (send or receive) before we decide to pad a
@@ -329,33 +332,25 @@ struct channel_t {
    */
   double (*get_overhead_estimate)(channel_t *);
   /*
-   * Ask the underlying transport what the remote endpoint address is, in
-   * a tor_addr_t.  This is optional and subclasses may leave this NULL.
-   * If they implement it, they should write the address out to the
-   * provided tor_addr_t *, and return 1 if successful or 0 if no address
-   * available.
+   * Ask the underlying transport what the remote endpoint address is, in a
+   * tor_addr_t.  Write the address out to the provided tor_addr_t *, and
+   * return 1 if successful or 0 if no address available.
    */
-  int (*get_remote_addr)(channel_t *, tor_addr_t *);
+  int (*get_remote_addr)(const channel_t *, tor_addr_t *);
   int (*get_transport_name)(channel_t *chan, char **transport_out);
 
-#define GRD_FLAG_ORIGINAL 1
-#define GRD_FLAG_ADDR_ONLY 2
   /**
-   * Get a text description of the remote endpoint; canonicalized if the flag
-   * GRD_FLAG_ORIGINAL is not set, or the one we originally connected
-   * to/received from if it is.  If GRD_FLAG_ADDR_ONLY is set, we return only
-   * the original address.
+   * Get a human-readable text description of the remote endpoint, for
+   * logging.
    */
-  const char * (*get_remote_descr)(channel_t *, int);
+  const char * (*describe_peer)(const channel_t *);
   /** Check if the lower layer has queued writes */
   int (*has_queued_writes)(channel_t *);
   /**
-   * If the second param is zero, ask the lower layer if this is
-   * 'canonical', for a transport-specific definition of canonical; if
-   * it is 1, ask if the answer to the preceding query is safe to rely
-   * on.
+   * Ask the lower layer if this is 'canonical', for a transport-specific
+   * definition of canonical.
    */
-  int (*is_canonical)(channel_t *, int);
+  int (*is_canonical)(channel_t *);
   /** Check if this channel matches a specified extend_info_t */
   int (*matches_extend_info)(channel_t *, extend_info_t *);
   /** Check if this channel matches a target address when extending */
@@ -562,7 +557,10 @@ void channel_listener_dumpstats(int severity);
 #ifdef CHANNEL_FILE_PRIVATE
 
 STATIC void channel_add_to_digest_map(channel_t *chan);
-
+STATIC bool channel_matches_target_addr_for_extend(
+                                          channel_t *chan,
+                                          const tor_addr_t *target_ipv4_addr,
+                                          const tor_addr_t *target_ipv6_addr);
 #endif /* defined(CHANNEL_FILE_PRIVATE) */
 
 /* Channel operations for subclasses and internal use only */
@@ -721,16 +719,13 @@ channel_is_in_state(channel_t *chan, channel_state_t state)
 const char * channel_describe_transport(channel_t *chan);
 MOCK_DECL(void, channel_dump_statistics, (channel_t *chan, int severity));
 void channel_dump_transport_statistics(channel_t *chan, int severity);
-const char * channel_get_actual_remote_descr(channel_t *chan);
-const char * channel_get_actual_remote_address(channel_t *chan);
-MOCK_DECL(int, channel_get_addr_if_possible, (channel_t *chan,
+MOCK_DECL(int, channel_get_addr_if_possible, (const channel_t *chan,
                                               tor_addr_t *addr_out));
-MOCK_DECL(const char *, channel_get_canonical_remote_descr,(channel_t *chan));
+MOCK_DECL(const char *, channel_describe_peer,(channel_t *chan));
 int channel_has_queued_writes(channel_t *chan);
 int channel_is_bad_for_new_circs(channel_t *chan);
 void channel_mark_bad_for_new_circs(channel_t *chan);
 int channel_is_canonical(channel_t *chan);
-int channel_is_canonical_is_reliable(channel_t *chan);
 int channel_is_client(const channel_t *chan);
 int channel_is_local(channel_t *chan);
 int channel_is_incoming(channel_t *chan);

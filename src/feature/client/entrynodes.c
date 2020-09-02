@@ -1466,7 +1466,7 @@ node_passes_guard_filter(const or_options_t *options,
       !routerset_contains_node(options->EntryNodes, node))
     return 0;
 
-  if (!fascist_firewall_allows_node(node, FIREWALL_OR_CONNECTION, 0))
+  if (!reachable_addr_allows_node(node, FIREWALL_OR_CONNECTION, 0))
     return 0;
 
   if (node_is_a_configured_bridge(node))
@@ -1492,7 +1492,7 @@ bridge_passes_guard_filter(const or_options_t *options,
   /* Ignore entrynodes */
   const tor_addr_port_t *addrport = bridge_get_addr_port(bridge);
 
-  if (!fascist_firewall_allows_address_addr(&addrport->addr,
+  if (!reachable_addr_allows_addr(&addrport->addr,
                                             addrport->port,
                                             FIREWALL_OR_CONNECTION,
                                             0, 0))
@@ -1576,12 +1576,12 @@ guard_create_exit_restriction(const uint8_t *exit_id)
 }
 
 /** If we have fewer than this many possible usable guards, don't set
- * MD-availability-based restrictions: we might blacklist all of them. */
+ * MD-availability-based restrictions: we might denylist all of them. */
 #define MIN_GUARDS_FOR_MD_RESTRICTION 10
 
 /** Return true if we should set md dirserver restrictions. We might not want
  *  to set those if our guard options are too restricted, since we don't want
- *  to blacklist all of them. */
+ *  to denylist all of them. */
 static int
 should_set_md_dirserver_restriction(void)
 {
@@ -3139,9 +3139,9 @@ entry_guard_parse_from_state(const char *s)
 
     guard->sampled_idx = guard->confirmed_idx;
   } else {
-    log_warn(LD_GUARD, "The state file seems to be into a status that could"
-        " yield to weird entry node selection: we're missing both a"
-        " sampled_idx and a confirmed_idx.");
+    log_info(LD_GUARD, "The state file seems to be into a status that could"
+             " yield to weird entry node selection: we're missing both a"
+             " sampled_idx and a confirmed_idx.");
     guard->sampled_idx = invalid_sampled_idx++;
   }
 

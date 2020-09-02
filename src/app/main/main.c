@@ -53,18 +53,21 @@
 #include "feature/rend/rendcache.h"
 #include "feature/rend/rendservice.h"
 #include "feature/stats/predict_ports.h"
+#include "feature/stats/bwhist.h"
 #include "feature/stats/rephist.h"
 #include "lib/compress/compress.h"
 #include "lib/buf/buffers.h"
 #include "lib/crypt_ops/crypto_rand.h"
 #include "lib/crypt_ops/crypto_s2k.h"
 #include "lib/net/resolve.h"
+#include "lib/trace/trace.h"
 
 #include "lib/process/waitpid.h"
 #include "lib/pubsub/pubsub_build.h"
 
 #include "lib/meminfo/meminfo.h"
 #include "lib/osinfo/uname.h"
+#include "lib/osinfo/libc.h"
 #include "lib/sandbox/sandbox.h"
 #include "lib/fs/lockfile.h"
 #include "lib/tls/tortls.h"
@@ -336,15 +339,11 @@ dumpstats(int severity)
   SMARTLIST_FOREACH_BEGIN(get_connection_array(), connection_t *, conn) {
     int i = conn_sl_idx;
     tor_log(severity, LD_GENERAL,
-        "Conn %d (socket %d) type %d (%s), state %d (%s), created %d secs ago",
-        i, (int)conn->s, conn->type, conn_type_to_string(conn->type),
-        conn->state, conn_state_to_string(conn->type, conn->state),
+        "Conn %d (socket %d) is a %s, created %d secs ago",
+        i, (int)conn->s,
+        connection_describe(conn),
         (int)(now - conn->timestamp_created));
     if (!connection_is_listener(conn)) {
-      tor_log(severity,LD_GENERAL,
-          "Conn %d is to %s:%d.", i,
-          safe_str_client(conn->address),
-          conn->port);
       tor_log(severity,LD_GENERAL,
           "Conn %d: %d bytes waiting on inbuf (len %d, last read %d secs ago)",
           i,
@@ -549,6 +548,7 @@ tor_init(int argc, char *argv[])
 
   /* Initialize the history structures. */
   rep_hist_init();
+  bwhist_init();
   /* Initialize the service cache. */
   rend_cache_init();
   addressmap_init(); /* Init the client dns cache. Do it always, since it's
@@ -575,7 +575,8 @@ tor_init(int argc, char *argv[])
     const char *version = get_version();
 
     log_notice(LD_GENERAL, "Tor %s running on %s with Libevent %s, "
-               "%s %s, Zlib %s, Liblzma %s, and Libzstd %s.", version,
+               "%s %s, Zlib %s, Liblzma %s, Libzstd %s and %s %s as libc.",
+               version,
                get_uname(),
                tor_libevent_get_version_str(),
                crypto_get_library_name(),
@@ -585,7 +586,10 @@ tor_init(int argc, char *argv[])
                tor_compress_supports_method(LZMA_METHOD) ?
                  tor_compress_version_str(LZMA_METHOD) : "N/A",
                tor_compress_supports_method(ZSTD_METHOD) ?
-                 tor_compress_version_str(ZSTD_METHOD) : "N/A");
+                 tor_compress_version_str(ZSTD_METHOD) : "N/A",
+               tor_libc_get_name() ?
+                 tor_libc_get_name() : "Unknown",
+               tor_libc_get_version_str());
 
     log_notice(LD_GENERAL, "Tor can't help you if you use it wrong! "
                "Learn how to be safe at "
@@ -601,6 +605,9 @@ tor_init(int argc, char *argv[])
 #ifdef HAVE_RUST
   rust_log_welcome_string();
 #endif /* defined(HAVE_RUST) */
+
+  /* Warn _if_ the tracing subsystem is built in. */
+  tracing_log_warning();
 
   int init_rv = options_init_from_torrc(argc,argv);
   if (init_rv < 0) {
@@ -823,6 +830,9 @@ sandbox_init_filter(void)
 #define OPEN(name)                              \
   sandbox_cfg_allow_open_filename(&cfg, tor_strdup(name))
 
+#define OPENDIR(dir)                            \
+  sandbox_cfg_allow_opendir_dirname(&cfg, tor_strdup(dir))
+
 #define OPEN_DATADIR(name)                      \
   sandbox_cfg_allow_open_filename(&cfg, get_datadir_fname(name))
 
@@ -839,8 +849,10 @@ sandbox_init_filter(void)
     OPEN_DATADIR2(name, name2 suffix);                  \
   } while (0)
 
+// KeyDirectory is a directory, but it is only opened in check_private_dir
+// which calls open instead of opendir
 #define OPEN_KEY_DIRECTORY() \
-  sandbox_cfg_allow_open_filename(&cfg, tor_strdup(options->KeyDirectory))
+  OPEN(options->KeyDirectory)
 #define OPEN_CACHEDIR(name)                      \
   sandbox_cfg_allow_open_filename(&cfg, get_cachedir_fname(name))
 #define OPEN_CACHEDIR_SUFFIX(name, suffix) do {  \
@@ -854,6 +866,8 @@ sandbox_init_filter(void)
     OPEN_KEYDIR(name suffix);                    \
   } while (0)
 
+  // DataDirectory is a directory, but it is only opened in check_private_dir
+  // which calls open instead of opendir
   OPEN(options->DataDirectory);
   OPEN_KEY_DIRECTORY();
 
@@ -901,7 +915,11 @@ sandbox_init_filter(void)
   }
 
   SMARTLIST_FOREACH(options->FilesOpenedByIncludes, char *, f, {
-    OPEN(f);
+    if (file_status(f) == FN_DIR) {
+      OPENDIR(f);
+    } else {
+      OPEN(f);
+    }
   });
 
 #define RENAME_SUFFIX(name, suffix)        \
@@ -1014,7 +1032,7 @@ sandbox_init_filter(void)
      * directory that holds it. */
     char *dirname = tor_strdup(port->unix_addr);
     if (get_parent_directory(dirname) == 0) {
-      OPEN(dirname);
+      OPENDIR(dirname);
     }
     tor_free(dirname);
     sandbox_cfg_allow_chmod_filename(&cfg, tor_strdup(port->unix_addr));

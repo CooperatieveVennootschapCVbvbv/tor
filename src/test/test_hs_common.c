@@ -293,7 +293,6 @@ helper_add_hsdir_to_networkstatus(networkstatus_t *ns,
   routerstatus_t *rs = tor_malloc_zero(sizeof(routerstatus_t));
   routerinfo_t *ri = tor_malloc_zero(sizeof(routerinfo_t));
   uint8_t identity[DIGEST_LEN];
-  tor_addr_t ipv4_addr;
   node_t *node = NULL;
 
   memset(identity, identity_idx, sizeof(identity));
@@ -302,9 +301,8 @@ helper_add_hsdir_to_networkstatus(networkstatus_t *ns,
   rs->is_hs_dir = is_hsdir;
   rs->pv.supports_v3_hsdir = 1;
   strlcpy(rs->nickname, nickname, sizeof(rs->nickname));
-  tor_addr_parse(&ipv4_addr, "1.2.3.4");
-  ri->addr = tor_addr_to_ipv4h(&ipv4_addr);
-  rs->addr = tor_addr_to_ipv4h(&ipv4_addr);
+  tor_addr_parse(&ri->ipv4_addr, "1.2.3.4");
+  tor_addr_parse(&rs->ipv4_addr, "1.2.3.4");
   ri->nickname = tor_strdup(nickname);
   ri->protocol_list = tor_strdup("HSDir=1-2 LinkAuth=3");
   memcpy(ri->cache_info.identity_digest, identity, DIGEST_LEN);
@@ -792,6 +790,8 @@ test_parse_extended_hostname(void *arg)
     "www.25njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
   char address9[] =
     "www.15njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid.onion";
+  char address10[] =
+    "15njqamcweflpvkl73j4szahhihoc4xt3ktcgjnpaingr5yhkenl5sid7jdl.onion";
 
   tt_assert(!parse_extended_hostname(address1, &type));
   tt_int_op(type, OP_EQ, BAD_HOSTNAME);
@@ -824,7 +824,11 @@ test_parse_extended_hostname(void *arg)
 
   /* Invalid v3 address. */
   tt_assert(!parse_extended_hostname(address9, &type));
-  tt_int_op(type, OP_EQ, ONION_V3_HOSTNAME);
+  tt_int_op(type, OP_EQ, BAD_HOSTNAME);
+
+  /* Invalid v3 address: too long */
+  tt_assert(!parse_extended_hostname(address10, &type));
+  tt_int_op(type, OP_EQ, BAD_HOSTNAME);
 
  done: ;
 }

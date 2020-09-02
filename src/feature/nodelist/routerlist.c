@@ -506,7 +506,8 @@ router_dir_conn_should_skip_reachable_address_check(
 int
 routers_have_same_or_addrs(const routerinfo_t *r1, const routerinfo_t *r2)
 {
-  return r1->addr == r2->addr && r1->or_port == r2->or_port &&
+  return tor_addr_eq(&r1->ipv4_addr, &r2->ipv4_addr) &&
+    r1->ipv4_orport == r2->ipv4_orport &&
     tor_addr_eq(&r1->ipv6_addr, &r2->ipv6_addr) &&
     r1->ipv6_orport == r2->ipv6_orport;
 }
@@ -538,7 +539,7 @@ routers_have_same_or_addrs(const routerinfo_t *r1, const routerinfo_t *r2)
  *  - <b>CRN_DIRECT_CONN</b>: is suitable for direct connections. Checks
  *                            for the relevant descriptors. Checks the address
  *                            against ReachableAddresses, ClientUseIPv4 0, and
- *                            fascist_firewall_use_ipv6() == 0);
+ *                            reachable_addr_use_ipv6() == 0);
  *  - <b>CRN_PREF_ADDR</b>: if we are connecting directly to the node, it has
  *                          an address that is preferred by the
  *                          ClientPreferIPv6ORPort setting;
@@ -593,7 +594,7 @@ router_can_choose_node(const node_t *node, int flags)
     return false;
   /* Choose a node with an OR address that matches the firewall rules */
   if (direct_conn && check_reach &&
-      !fascist_firewall_allows_node(node,
+      !reachable_addr_allows_node(node,
                                     FIREWALL_OR_CONNECTION,
                                     pref_addr))
     return false;
@@ -2964,12 +2965,12 @@ router_differences_are_cosmetic(const routerinfo_t *r1, const routerinfo_t *r2)
   }
 
   /* If any key fields differ, they're different. */
-  if (r1->addr != r2->addr ||
+  if (!tor_addr_eq(&r1->ipv4_addr, &r2->ipv4_addr) ||
       strcasecmp(r1->nickname, r2->nickname) ||
-      r1->or_port != r2->or_port ||
+      r1->ipv4_orport != r2->ipv4_orport ||
       !tor_addr_eq(&r1->ipv6_addr, &r2->ipv6_addr) ||
       r1->ipv6_orport != r2->ipv6_orport ||
-      r1->dir_port != r2->dir_port ||
+      r1->ipv4_dirport != r2->ipv4_dirport ||
       r1->purpose != r2->purpose ||
       r1->onion_pkey_len != r2->onion_pkey_len ||
       !tor_memeq(r1->onion_pkey, r2->onion_pkey, r1->onion_pkey_len) ||

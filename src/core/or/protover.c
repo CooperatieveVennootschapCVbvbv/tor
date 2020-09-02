@@ -250,7 +250,8 @@ parse_single_entry(const char *s, const char *end_of_entry)
     }
 
     s = comma;
-    while (*s == ',' && s < end_of_entry)
+    // Skip the comma separator between ranges. Don't ignore a trailing comma.
+    if (s < (end_of_entry - 1))
       ++s;
   }
 
@@ -298,11 +299,12 @@ parse_protocol_list(const char *s)
 }
 
 /**
- * Return true if the unparsed protover in <b>s</b> would contain a protocol
- * name longer than MAX_PROTOCOL_NAME_LENGTH, and false otherwise.
+ * Return true if the unparsed protover list in <b>s</b> contains a
+ * parsing error, such as extra commas, a bad number, or an over-long
+ * name.
  */
 bool
-protover_contains_long_protocol_names(const char *s)
+protover_list_is_invalid(const char *s)
 {
   smartlist_t *list = parse_protocol_list(s);
   if (!list)
@@ -393,6 +395,11 @@ protocol_list_supports_protocol_or_later(const char *list,
 const char *
 protover_get_supported_protocols(void)
 {
+  /* WARNING!
+   *
+   * Remember to edit the SUPPORTED_PROTOCOLS list in protover.rs if you
+   * are editing this list.
+   */
   return
     "Cons=1-2 "
     "Desc=1-2 "

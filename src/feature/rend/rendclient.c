@@ -15,6 +15,7 @@
 #include "core/or/circuitlist.h"
 #include "core/or/circuituse.h"
 #include "core/or/connection_edge.h"
+#include "core/or/extendinfo.h"
 #include "core/or/relay.h"
 #include "feature/client/circpathbias.h"
 #include "feature/control/control_events.h"
@@ -234,9 +235,15 @@ rend_client_send_introduction(origin_circuit_t *introcirc,
     /* version 2 format */
     extend_info_t *extend_info = rendcirc->build_state->chosen_exit;
     int klen;
+    const tor_addr_port_t *orport =
+      extend_info_get_orport(extend_info, AF_INET);
+    IF_BUG_ONCE(! orport) {
+      /* we should never put an IPv6 address here. */
+      goto perm_err;
+    }
     /* nul pads */
-    set_uint32(tmp+v3_shift+1, tor_addr_to_ipv4n(&extend_info->addr));
-    set_uint16(tmp+v3_shift+5, htons(extend_info->port));
+    set_uint32(tmp+v3_shift+1, tor_addr_to_ipv4n(&orport->addr));
+    set_uint16(tmp+v3_shift+5, htons(orport->port));
     memcpy(tmp+v3_shift+7, extend_info->identity_digest, DIGEST_LEN);
     klen = crypto_pk_asn1_encode(extend_info->onion_key,
                                  tmp+v3_shift+7+DIGEST_LEN+2,
@@ -261,8 +268,8 @@ rend_client_send_introduction(origin_circuit_t *introcirc,
             > MAX_NICKNAME_LEN)) {
       goto perm_err;
     }
-    strncpy(tmp, rendcirc->build_state->chosen_exit->nickname,
-            (MAX_NICKNAME_LEN+1)); /* nul pads */
+    strlcpy(tmp, rendcirc->build_state->chosen_exit->nickname,
+            sizeof(tmp));
     memcpy(tmp+MAX_NICKNAME_LEN+1, rendcirc->rend_data->rend_cookie,
            REND_COOKIE_LEN);
     dh_offset = MAX_NICKNAME_LEN+1+REND_COOKIE_LEN;

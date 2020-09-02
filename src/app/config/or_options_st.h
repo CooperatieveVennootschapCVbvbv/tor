@@ -35,6 +35,12 @@ typedef enum {
   TCP_PROXY_PROTOCOL_HAPROXY
 } tcp_proxy_protocol_t;
 
+/** Enumeration of available time formats for output of --key-expiration */
+typedef enum {
+  KEY_EXPIRATION_FORMAT_ISO8601 = 0,
+  KEY_EXPIRATION_FORMAT_TIMESTAMP
+} key_expiration_format_t;
+
 /** Configuration options for a Tor process. */
 struct or_options_t {
   uint32_t magic_;
@@ -74,6 +80,10 @@ struct or_options_t {
   /** OR only: configured address for this onion router. Up to two times this
    * options is accepted as in IPv4 and IPv6. */
   struct config_line_t *Address;
+
+  /** Boolean: If set, disable IPv6 address resolution, IPv6 ORPorts, IPv6
+   * reachability checks, and publishing an IPv6 ORPort in its descriptor. */
+  int AddressDisableIPv6;
 
   char *PidFile; /**< Where to store PID of Tor process. */
 
@@ -658,7 +668,7 @@ struct or_options_t {
   int ClientUseIPv4;
   /** If true, clients may connect over IPv6. If false, they will avoid
    * connecting over IPv4. We enforce this for OR and Dir connections.
-   * Use fascist_firewall_use_ipv6() instead of accessing this value
+   * Use reachable_addr_use_ipv6() instead of accessing this value
    * directly. */
   int ClientUseIPv6;
   /** If true, prefer an IPv6 OR port over an IPv4 one for entry node
@@ -668,7 +678,7 @@ struct or_options_t {
   int ClientPreferIPv6ORPort;
   /** If true, prefer an IPv6 directory port over an IPv4 one for direct
    * directory connections. If auto, bridge clients prefer IPv6, and other
-   * clients prefer IPv4. Use fascist_firewall_prefer_ipv6_dirport() instead of
+   * clients prefer IPv4. Use reachable_addr_prefer_ipv6_dirport() instead of
    * accessing this value directly.  */
   int ClientPreferIPv6DirPort;
 
@@ -939,6 +949,8 @@ struct or_options_t {
   /** Force use of offline master key features: never generate a master
    * ed25519 identity key except from tor --keygen */
   int OfflineMasterKey;
+
+  key_expiration_format_t key_expiration_format;
 
   enum {
     FORCE_PASSPHRASE_AUTO=0,

@@ -306,12 +306,19 @@ routerset_add_unknown_ccs(routerset_t **setp, int only_if_some_cc_set)
 int
 routerset_contains_extendinfo(const routerset_t *set, const extend_info_t *ei)
 {
-  return routerset_contains(set,
-                            &ei->addr,
-                            ei->port,
-                            ei->nickname,
-                            ei->identity_digest,
-                            -1 /*country*/);
+  const tor_addr_port_t *ap1 = NULL, *ap2 = NULL;
+  if (! tor_addr_is_null(&ei->orports[0].addr))
+    ap1 = &ei->orports[0];
+  if (! tor_addr_is_null(&ei->orports[1].addr))
+    ap2 = &ei->orports[1];
+  return routerset_contains2(set,
+                             ap1 ? &ap1->addr : NULL,
+                             ap1 ? ap1->port : 0,
+                             ap2 ? &ap2->addr : NULL,
+                             ap2 ? ap2->port : 0,
+                             ei->nickname,
+                             ei->identity_digest,
+                             -1 /*country*/);
 }
 
 /** Return true iff <b>ri</b> is in <b>set</b>.  If country is <b>-1</b>, we
@@ -320,10 +327,8 @@ int
 routerset_contains_router(const routerset_t *set, const routerinfo_t *ri,
                           country_t country)
 {
-  tor_addr_t addr_v4;
-  tor_addr_from_ipv4h(&addr_v4, ri->addr);
-  return routerset_contains2(set, &addr_v4, ri->or_port, &ri->ipv6_addr,
-                             ri->ipv6_orport, ri->nickname,
+  return routerset_contains2(set, &ri->ipv4_addr, ri->ipv4_orport,
+                             &ri->ipv6_addr, ri->ipv6_orport, ri->nickname,
                              ri->cache_info.identity_digest, country);
 }
 
@@ -334,11 +339,9 @@ routerset_contains_routerstatus(const routerset_t *set,
                                 const routerstatus_t *rs,
                                 country_t country)
 {
-  tor_addr_t addr;
-  tor_addr_from_ipv4h(&addr, rs->addr);
   return routerset_contains(set,
-                            &addr,
-                            rs->or_port,
+                            &rs->ipv4_addr,
+                            rs->ipv4_orport,
                             rs->nickname,
                             rs->identity_digest,
                             country);

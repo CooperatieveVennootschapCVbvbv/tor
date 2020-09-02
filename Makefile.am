@@ -164,6 +164,8 @@ include src/include.am
 include doc/include.am
 include contrib/include.am
 
+manpages: $(nodist_man1_MANS)
+
 EXTRA_DIST+= \
 	ChangeLog							\
 	CONTRIBUTING							\
@@ -273,9 +275,7 @@ check-local:					\
 	check-spaces				\
 	check-changes				\
 	check-includes				\
-	check-best-practices			\
-	shellcheck				\
-	check-cocci
+	shellcheck
 
 # test-network requires a copy of Chutney in $CHUTNEY_PATH.
 # Chutney can be cloned from https://git.torproject.org/chutney.git .

@@ -21,10 +21,10 @@
 #include "core/or/circuituse.h"
 #include "core/or/connection_edge.h"
 #include "core/or/circuitstats.h"
+#include "core/or/extendinfo.h"
 #include "feature/client/addressmap.h"
 #include "feature/client/dnsserv.h"
 #include "feature/client/entrynodes.h"
-#include "feature/control/control_events.h"
 #include "feature/control/control.h"
 #include "feature/control/control_auth.h"
 #include "feature/control/control_cmd.h"
@@ -981,8 +981,7 @@ handle_control_attachstream(control_connection_t *conn,
     edge_conn->end_reason = 0;
     if (tmpcirc)
       circuit_detach_stream(tmpcirc, edge_conn);
-    CONNECTION_AP_EXPECT_NONPENDING(ap_conn);
-    TO_CONN(edge_conn)->state = AP_CONN_STATE_CONTROLLER_WAIT;
+    connection_entry_set_controller_wait(ap_conn);
   }
 
   if (circ && (circ->base_.state != CIRCUIT_STATE_OPEN)) {

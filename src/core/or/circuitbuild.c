@@ -45,10 +45,12 @@
 #include "core/or/command.h"
 #include "core/or/connection_edge.h"
 #include "core/or/connection_or.h"
+#include "core/or/extendinfo.h"
 #include "core/or/onion.h"
 #include "core/or/ocirc_event.h"
 #include "core/or/policies.h"
 #include "core/or/relay.h"
+#include "core/or/trace_probes_circuit.h"
 #include "core/or/crypt_path.h"
 #include "feature/client/bridges.h"
 #include "feature/client/circpathbias.h"
@@ -70,6 +72,7 @@
 #include "feature/rend/rendcommon.h"
 #include "feature/stats/predict_ports.h"
 #include "lib/crypt_ops/crypto_rand.h"
+#include "lib/trace/events.h"
 
 #include "core/or/cell_st.h"
 #include "core/or/cpath_build_state_st.h"
@@ -78,9 +81,6 @@
 #include "feature/nodelist/node_st.h"
 #include "core/or/or_circuit_st.h"
 #include "core/or/origin_circuit_st.h"
-#include "feature/nodelist/microdesc_st.h"
-#include "feature/nodelist/routerinfo_st.h"
-#include "feature/nodelist/routerstatus_st.h"
 
 static int circuit_send_first_onion_skin(origin_circuit_t *circ);
 static int circuit_build_no_more_hops(origin_circuit_t *circ);
@@ -96,13 +96,17 @@ static const node_t *choose_good_middle_server(uint8_t purpose,
  * callbacks.
  */
 MOCK_IMPL(channel_t *,
-channel_connect_for_circuit,(const tor_addr_t *addr, uint16_t port,
-                             const char *id_digest,
-                             const struct ed25519_public_key_t *ed_id))
+channel_connect_for_circuit,(const extend_info_t *ei))
 {
   channel_t *chan;
 
-  chan = channel_connect(addr, port, id_digest, ed_id);
+  const tor_addr_port_t *orport = extend_info_pick_orport(ei);
+  if (!orport)
+    return NULL;
+  const char *id_digest = ei->identity_digest;
+  const ed25519_public_key_t *ed_id = &ei->ed_identity;
+
+  chan = channel_connect(&orport->addr, orport->port, id_digest, ed_id);
   if (chan) command_setup_channel(chan);
 
   return chan;
@@ -495,6 +499,8 @@ circuit_establish_circuit(uint8_t purpose, extend_info_t *exit_ei, int flags)
     circuit_mark_for_close(TO_CIRCUIT(circ), -err_reason);
     return NULL;
   }
+
+  tor_trace(TR_SUBSYS(circuit), TR_EV(establish), circ);
   return circ;
 }
 
@@ -550,7 +556,7 @@ circuit_handle_first_hop(origin_circuit_t *circ)
    * - the address is internal, and
    * - we're not connecting to a configured bridge, and
    * - we're not configured to allow extends to private addresses. */
-  if (tor_addr_is_internal(&firsthop->extend_info->addr, 0) &&
+  if (extend_info_any_orport_addr_is_internal(firsthop->extend_info) &&
       !extend_info_is_a_configured_bridge(firsthop->extend_info) &&
       !options->ExtendAllowPrivateAddresses) {
     log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
@@ -559,19 +565,15 @@ circuit_handle_first_hop(origin_circuit_t *circ)
   }
 
   /* now see if we're already connected to the first OR in 'route' */
-  log_debug(LD_CIRC,"Looking for firsthop '%s'",
-            fmt_addrport(&firsthop->extend_info->addr,
-                         firsthop->extend_info->port));
-
-  /* We'll cleanup this code in #33220, when we add an IPv6 address to
-   * extend_info_t. */
-  const bool addr_is_ipv4 =
-    (tor_addr_family(&firsthop->extend_info->addr) == AF_INET);
+  const tor_addr_port_t *orport4 =
+    extend_info_get_orport(firsthop->extend_info, AF_INET);
+  const tor_addr_port_t *orport6 =
+    extend_info_get_orport(firsthop->extend_info, AF_INET6);
   n_chan = channel_get_for_extend(
                           firsthop->extend_info->identity_digest,
                           &firsthop->extend_info->ed_identity,
-                          addr_is_ipv4 ? &firsthop->extend_info->addr : NULL,
-                          addr_is_ipv4 ? NULL : &firsthop->extend_info->addr,
+                          orport4 ? &orport4->addr : NULL,
+                          orport6 ? &orport6->addr : NULL,
                           &msg,
                           &should_launch);
 
@@ -583,11 +585,7 @@ circuit_handle_first_hop(origin_circuit_t *circ)
     circ->base_.n_hop = extend_info_dup(firsthop->extend_info);
 
     if (should_launch) {
-      n_chan = channel_connect_for_circuit(
-          &firsthop->extend_info->addr,
-          firsthop->extend_info->port,
-          firsthop->extend_info->identity_digest,
-          &firsthop->extend_info->ed_identity);
+      n_chan = channel_connect_for_circuit(firsthop->extend_info);
       if (!n_chan) { /* connect failed, forget the whole thing */
         log_info(LD_CIRC,"connect to firsthop failed. Closing.");
         return -END_CIRC_REASON_CONNECTFAILED;
@@ -605,7 +603,8 @@ circuit_handle_first_hop(origin_circuit_t *circ)
     tor_assert(!circ->base_.n_hop);
     circ->base_.n_chan = n_chan;
     circuit_chan_publish(circ, n_chan);
-    log_debug(LD_CIRC,"Conn open. Delivering first onion skin.");
+    log_debug(LD_CIRC,"Conn open for %s. Delivering first onion skin.",
+              safe_str_client(extend_info_describe(firsthop->extend_info)));
     if ((err_reason = circuit_send_next_onion_skin(circ)) < 0) {
       log_info(LD_CIRC,"circuit_send_next_onion_skin failed.");
       circ->base_.n_chan = NULL;
@@ -633,7 +632,7 @@ circuit_n_chan_done(channel_t *chan, int status, int close_origin_circuits)
   tor_assert(chan);
 
   log_debug(LD_CIRC,"chan to %s, status=%d",
-            channel_get_canonical_remote_descr(chan), status);
+            channel_describe_peer(chan), status);
 
   pending_circs = smartlist_new();
   circuit_get_all_pending_on_channel(pending_circs, chan);
@@ -731,6 +730,8 @@ circuit_deliver_create_cell,(circuit_t *circ,
                    "failed to get unique circID.");
     goto error;
   }
+
+  tor_assert_nonfatal_once(circ->n_chan->is_canonical);
 
   memset(&cell, 0, sizeof(cell_t));
   r = relayed ? create_cell_format_relayed(&cell, create_cell)
@@ -984,6 +985,7 @@ circuit_send_first_onion_skin(origin_circuit_t *circ)
 
   if (circuit_deliver_create_cell(TO_CIRCUIT(circ), &cc, 0) < 0)
     return - END_CIRC_REASON_RESOURCELIMIT;
+  tor_trace(TR_SUBSYS(circuit), TR_EV(first_onion_skin), circ, circ->cpath);
 
   circ->cpath->state = CPATH_STATE_AWAITING_KEYS;
   circuit_set_state(TO_CIRCUIT(circ), CIRCUIT_STATE_BUILDING);
@@ -1078,42 +1080,40 @@ circuit_send_intermediate_onion_skin(origin_circuit_t *circ,
                                      crypt_path_t *hop)
 {
   int len;
-  int family = tor_addr_family(&hop->extend_info->addr);
   extend_cell_t ec;
-  memset(&ec, 0, sizeof(ec));
-
-  log_debug(LD_CIRC,"starting to send subsequent skin.");
-
   /* Relays and bridges can send IPv6 extends. But for clients, it's an
    * obvious version distinguisher. */
-  if (server_mode(get_options())) {
-    if (family != AF_INET && family != AF_INET6) {
-      log_warn(LD_BUG, "Server trying to extend to an invalid address "
-               "family.");
-      return - END_CIRC_REASON_INTERNAL;
-    }
-  } else {
-    if (family != AF_INET) {
-      log_warn(LD_BUG, "Client trying to extend to a non-IPv4 address.");
-      return - END_CIRC_REASON_INTERNAL;
-    }
-  }
+  const bool include_ipv6 = server_mode(get_options());
+  memset(&ec, 0, sizeof(ec));
+  tor_addr_make_unspec(&ec.orport_ipv4.addr);
+  tor_addr_make_unspec(&ec.orport_ipv6.addr);
+
+  log_debug(LD_CIRC,"starting to send subsequent skin.");
 
   circuit_pick_extend_handshake(&ec.cell_type,
                                 &ec.create_cell.cell_type,
                                 &ec.create_cell.handshake_type,
                                 hop->extend_info);
 
-  /* At the moment, extend_info only has one ORPort address. We'll add a
-   * second address in #34069, to support dual-stack extend cells. */
-  if (family == AF_INET) {
-    tor_addr_copy(&ec.orport_ipv4.addr, &hop->extend_info->addr);
-    ec.orport_ipv4.port = hop->extend_info->port;
-    tor_addr_make_unspec(&ec.orport_ipv6.addr);
-  } else {
-    tor_addr_copy(&ec.orport_ipv6.addr, &hop->extend_info->addr);
-    ec.orport_ipv6.port = hop->extend_info->port;
-    tor_addr_make_unspec(&ec.orport_ipv4.addr);
+  const tor_addr_port_t *orport4 =
+    extend_info_get_orport(hop->extend_info, AF_INET);
+  const tor_addr_port_t *orport6 =
+    extend_info_get_orport(hop->extend_info, AF_INET6);
+  int n_addrs_set = 0;
+  if (orport4) {
+    tor_addr_copy(&ec.orport_ipv4.addr, &orport4->addr);
+    ec.orport_ipv4.port = orport4->port;
+    ++n_addrs_set;
+  }
+  if (orport6 && include_ipv6) {
+    tor_addr_copy(&ec.orport_ipv6.addr, &orport6->addr);
+    ec.orport_ipv6.port = orport6->port;
+    ++n_addrs_set;
+  }
+
+  if (n_addrs_set == 0) {
+    log_warn(LD_BUG, "No supported address family found in extend_info.");
+    return - END_CIRC_REASON_INTERNAL;
   }
   memcpy(ec.node_id, hop->extend_info->identity_digest, DIGEST_LEN);
   /* Set the ED25519 identity too -- it will only get included
@@ -1149,6 +1149,7 @@ circuit_send_intermediate_onion_skin(origin_circuit_t *circ,
       return 0; /* circuit is closed */
   }
   hop->state = CPATH_STATE_AWAITING_KEYS;
+  tor_trace(TR_SUBSYS(circuit), TR_EV(intermediate_onion_skin), circ, hop);
   return 0;
 }
 
@@ -1778,7 +1779,7 @@ pick_restricted_middle_node(router_crn_flags_t flags,
 {
   const node_t *middle_node = NULL;
 
-  smartlist_t *whitelisted_live_middles = smartlist_new();
+  smartlist_t *allowlisted_live_middles = smartlist_new();
   smartlist_t *all_live_nodes = smartlist_new();
 
   tor_assert(pick_from);
@@ -1786,21 +1787,21 @@ pick_restricted_middle_node(router_crn_flags_t flags,
   /* Add all running nodes to all_live_nodes */
   router_add_running_nodes_to_smartlist(all_live_nodes, flags);
 
-  /* Filter all_live_nodes to only add live *and* whitelisted middles
-   * to the list whitelisted_live_middles. */
+  /* Filter all_live_nodes to only add live *and* allowlisted middles
+   * to the list allowlisted_live_middles. */
   SMARTLIST_FOREACH_BEGIN(all_live_nodes, node_t *, live_node) {
     if (routerset_contains_node(pick_from, live_node)) {
-      smartlist_add(whitelisted_live_middles, live_node);
+      smartlist_add(allowlisted_live_middles, live_node);
     }
   } SMARTLIST_FOREACH_END(live_node);
 
   /* Honor ExcludeNodes */
   if (exclude_set) {
-    routerset_subtract_nodes(whitelisted_live_middles, exclude_set);
+    routerset_subtract_nodes(allowlisted_live_middles, exclude_set);
   }
 
   if (exclude_list) {
-    smartlist_subtract(whitelisted_live_middles, exclude_list);
+    smartlist_subtract(allowlisted_live_middles, exclude_list);
   }
 
   /**
@@ -1816,9 +1817,9 @@ pick_restricted_middle_node(router_crn_flags_t flags,
    * If there are a lot of nodes in here, assume they did not load balance
    * and do it for them, but also warn them that they may be Doing It Wrong.
    */
-  if (smartlist_len(whitelisted_live_middles) <=
+  if (smartlist_len(allowlisted_live_middles) <=
           MAX_SANE_RESTRICTED_NODES) {
-    middle_node = smartlist_choose(whitelisted_live_middles);
+    middle_node = smartlist_choose(allowlisted_live_middles);
   } else {
     static ratelim_t pinned_notice_limit = RATELIM_INIT(24*3600);
     log_fn_ratelim(&pinned_notice_limit, LOG_NOTICE, LD_CIRC,
@@ -1826,17 +1827,17 @@ pick_restricted_middle_node(router_crn_flags_t flags,
             "in %d total nodes. This is a lot of nodes. "
             "You may want to consider using a Tor controller "
             "to select and update a smaller set of nodes instead.",
-            position_hint, smartlist_len(whitelisted_live_middles));
+            position_hint, smartlist_len(allowlisted_live_middles));
 
     /* NO_WEIGHTING here just means don't take node flags into account
      * (ie: use consensus measurement only). This is done so that
      * we don't further surprise the user by not using Exits that they
      * specified at all */
-    middle_node = node_sl_choose_by_bandwidth(whitelisted_live_middles,
+    middle_node = node_sl_choose_by_bandwidth(allowlisted_live_middles,
                                               NO_WEIGHTING);
   }
 
-  smartlist_free(whitelisted_live_middles);
+  smartlist_free(allowlisted_live_middles);
   smartlist_free(all_live_nodes);
 
   return middle_node;
@@ -2147,7 +2148,7 @@ count_acceptable_nodes, (const smartlist_t *nodes, int direct))
  * The alternative is building the circuit in reverse. Reverse calls to
  * onion_extend_cpath() (ie: select outer hops first) would then have the
  * property that you don't gain information about inner hops by observing
- * outer ones. See https://trac.torproject.org/projects/tor/ticket/24487
+ * outer ones. See https://bugs.torproject.org/tpo/core/tor/24487
  * for this.
  *
  * (Note further that we still exclude the exit to prevent A - B - A
@@ -2462,143 +2463,6 @@ onion_extend_cpath(origin_circuit_t *circ)
   return 0;
 }
 
-/** Allocate a new extend_info object based on the various arguments. */
-extend_info_t *
-extend_info_new(const char *nickname,
-                const char *rsa_id_digest,
-                const ed25519_public_key_t *ed_id,
-                crypto_pk_t *onion_key,
-                const curve25519_public_key_t *ntor_key,
-                const tor_addr_t *addr, uint16_t port)
-{
-  extend_info_t *info = tor_malloc_zero(sizeof(extend_info_t));
-  memcpy(info->identity_digest, rsa_id_digest, DIGEST_LEN);
-  if (ed_id && !ed25519_public_key_is_zero(ed_id))
-    memcpy(&info->ed_identity, ed_id, sizeof(ed25519_public_key_t));
-  if (nickname)
-    strlcpy(info->nickname, nickname, sizeof(info->nickname));
-  if (onion_key)
-    info->onion_key = crypto_pk_dup_key(onion_key);
-  if (ntor_key)
-    memcpy(&info->curve25519_onion_key, ntor_key,
-           sizeof(curve25519_public_key_t));
-  tor_addr_copy(&info->addr, addr);
-  info->port = port;
-  return info;
-}
-
-/** Allocate and return a new extend_info that can be used to build a
- * circuit to or through the node <b>node</b>. Use the primary address
- * of the node (i.e. its IPv4 address) unless
- * <b>for_direct_connect</b> is true, in which case the preferred
- * address is used instead. May return NULL if there is not enough
- * info about <b>node</b> to extend to it--for example, if the preferred
- * routerinfo_t or microdesc_t is missing, or if for_direct_connect is
- * true and none of the node's addresses is allowed by tor's firewall
- * and IP version config.
- **/
-extend_info_t *
-extend_info_from_node(const node_t *node, int for_direct_connect)
-{
-  crypto_pk_t *rsa_pubkey = NULL;
-  extend_info_t *info = NULL;
-  tor_addr_port_t ap;
-  int valid_addr = 0;
-
-  if (!node_has_preferred_descriptor(node, for_direct_connect)) {
-    return NULL;
-  }
-
-  /* Choose a preferred address first, but fall back to an allowed address. */
-  if (for_direct_connect)
-    fascist_firewall_choose_address_node(node, FIREWALL_OR_CONNECTION, 0, &ap);
-  else {
-    node_get_prim_orport(node, &ap);
-  }
-  valid_addr = tor_addr_port_is_valid_ap(&ap, 0);
-
-  if (valid_addr)
-    log_debug(LD_CIRC, "using %s for %s",
-              fmt_addrport(&ap.addr, ap.port),
-              node->ri ? node->ri->nickname : node->rs->nickname);
-  else
-    log_warn(LD_CIRC, "Could not choose valid address for %s",
-              node->ri ? node->ri->nickname : node->rs->nickname);
-
-  /* Every node we connect or extend to must support ntor */
-  if (!node_has_curve25519_onion_key(node)) {
-    log_fn(LOG_PROTOCOL_WARN, LD_CIRC,
-           "Attempted to create extend_info for a node that does not support "
-           "ntor: %s", node_describe(node));
-    return NULL;
-  }
-
-  const ed25519_public_key_t *ed_pubkey = NULL;
-
-  /* Don't send the ed25519 pubkey unless the target node actually supports
-   * authenticating with it. */
-  if (node_supports_ed25519_link_authentication(node, 0)) {
-    log_info(LD_CIRC, "Including Ed25519 ID for %s", node_describe(node));
-    ed_pubkey = node_get_ed25519_id(node);
-  } else if (node_get_ed25519_id(node)) {
-    log_info(LD_CIRC, "Not including the ed25519 ID for %s, since it won't "
-             "be able to authenticate it.",
-             node_describe(node));
-  }
-
-  /* Retrieve the curve25519 pubkey. */
-  const curve25519_public_key_t *curve_pubkey =
-    node_get_curve25519_onion_key(node);
-  rsa_pubkey = node_get_rsa_onion_key(node);
-
-  if (valid_addr && node->ri) {
-    info = extend_info_new(node->ri->nickname,
-                           node->identity,
-                           ed_pubkey,
-                           rsa_pubkey,
-                           curve_pubkey,
-                           &ap.addr,
-                           ap.port);
-  } else if (valid_addr && node->rs && node->md) {
-    info = extend_info_new(node->rs->nickname,
-                           node->identity,
-                           ed_pubkey,
-                           rsa_pubkey,
-                           curve_pubkey,
-                           &ap.addr,
-                           ap.port);
-  }
-
-  crypto_pk_free(rsa_pubkey);
-  return info;
-}
-
-/** Release storage held by an extend_info_t struct. */
-void
-extend_info_free_(extend_info_t *info)
-{
-  if (!info)
-    return;
-  crypto_pk_free(info->onion_key);
-  tor_free(info);
-}
-
-/** Allocate and return a new extend_info_t with the same contents as
- * <b>info</b>. */
-extend_info_t *
-extend_info_dup(extend_info_t *info)
-{
-  extend_info_t *newinfo;
-  tor_assert(info);
-  newinfo = tor_malloc(sizeof(extend_info_t));
-  memcpy(newinfo, info, sizeof(extend_info_t));
-  if (info->onion_key)
-    newinfo->onion_key = crypto_pk_dup_key(info->onion_key);
-  else
-    newinfo->onion_key = NULL;
-  return newinfo;
-}
-
 /** Return the node_t for the chosen exit router in <b>state</b>.
  * If there is no chosen exit, or if we don't know the node_t for
  * the chosen exit, return NULL.
@@ -2634,43 +2498,6 @@ build_state_get_exit_nickname(cpath_build_state_t *state)
   return state->chosen_exit->nickname;
 }
 
-/** Return true iff the given address can be used to extend to. */
-int
-extend_info_addr_is_allowed(const tor_addr_t *addr)
-{
-  tor_assert(addr);
-
-  /* Check if we have a private address and if we can extend to it. */
-  if ((tor_addr_is_internal(addr, 0) || tor_addr_is_multicast(addr)) &&
-      !get_options()->ExtendAllowPrivateAddresses) {
-    goto disallow;
-  }
-  /* Allowed! */
-  return 1;
- disallow:
-  return 0;
-}
-
-/* Does ei have a valid TAP key? */
-int
-extend_info_supports_tap(const extend_info_t* ei)
-{
-  tor_assert(ei);
-  /* Valid TAP keys are not NULL */
-  return ei->onion_key != NULL;
-}
-
-/* Does ei have a valid ntor key? */
-int
-extend_info_supports_ntor(const extend_info_t* ei)
-{
-  tor_assert(ei);
-  /* Valid ntor keys have at least one non-zero byte */
-  return !fast_mem_is_zero(
-                          (const char*)ei->curve25519_onion_key.public_key,
-                          CURVE25519_PUBKEY_LEN);
-}
-
 /* Is circuit purpose allowed to use the deprecated TAP encryption protocol?
  * The hidden service protocol still uses TAP for some connections, because
  * ntor onion keys aren't included in HS descriptors or INTRODUCE cells. */
@@ -2703,15 +2530,6 @@ circuit_has_usable_onion_key(const origin_circuit_t *circ)
   tor_assert(circ->cpath->extend_info);
   return (extend_info_supports_ntor(circ->cpath->extend_info) ||
           circuit_can_use_tap(circ));
-}
-
-/* Does ei have an onion key which it would prefer to use?
- * Currently, we prefer ntor keys*/
-int
-extend_info_has_preferred_onion_key(const extend_info_t* ei)
-{
-  tor_assert(ei);
-  return extend_info_supports_ntor(ei);
 }
 
 /** Find the circuits that are waiting to find out whether their guards are

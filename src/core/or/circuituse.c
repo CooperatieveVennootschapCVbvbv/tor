@@ -37,7 +37,9 @@
 #include "core/or/circuituse.h"
 #include "core/or/circuitpadding.h"
 #include "core/or/connection_edge.h"
+#include "core/or/extendinfo.h"
 #include "core/or/policies.h"
+#include "core/or/trace_probes_circuit.h"
 #include "feature/client/addressmap.h"
 #include "feature/client/bridges.h"
 #include "feature/client/circpathbias.h"
@@ -62,6 +64,7 @@
 #include "feature/stats/predict_ports.h"
 #include "lib/math/fp.h"
 #include "lib/time/tvdiff.h"
+#include "lib/trace/events.h"
 
 #include "core/or/cpath_build_state_st.h"
 #include "feature/dircommon/dir_connection_st.h"
@@ -202,8 +205,8 @@ circuit_is_acceptable(const origin_circuit_t *origin_circ,
           const int family = tor_addr_parse(&addr,
                                             conn->socks_request->address);
           if (family < 0 ||
-              !tor_addr_eq(&build_state->chosen_exit->addr, &addr) ||
-              build_state->chosen_exit->port != conn->socks_request->port)
+              !extend_info_has_orport(build_state->chosen_exit, &addr,
+                                      conn->socks_request->port))
             return 0;
         }
       }
@@ -816,7 +819,7 @@ circuit_expire_building(void)
       log_info(LD_CIRC,
                "Abandoning circ %u %s:%u (state %d,%d:%s, purpose %d, "
                "len %d)", TO_ORIGIN_CIRCUIT(victim)->global_identifier,
-               channel_get_canonical_remote_descr(victim->n_chan),
+               channel_describe_peer(victim->n_chan),
                (unsigned)victim->n_circ_id,
                TO_ORIGIN_CIRCUIT(victim)->has_opened,
                victim->state, circuit_state_to_string(victim->state),
@@ -837,6 +840,7 @@ circuit_expire_building(void)
                  -1);
 
     circuit_log_path(LOG_INFO,LD_CIRC,TO_ORIGIN_CIRCUIT(victim));
+    tor_trace(TR_SUBSYS(circuit), TR_EV(timeout), TO_ORIGIN_CIRCUIT(victim));
     if (victim->purpose == CIRCUIT_PURPOSE_C_MEASURE_TIMEOUT)
       circuit_mark_for_close(victim, END_CIRC_REASON_MEASUREMENT_EXPIRED);
     else
@@ -1500,8 +1504,11 @@ circuit_expire_old_circuits_clientside(void)
                 circ->purpose);
       /* Don't do this magic for testing circuits. Their death is governed
        * by circuit_expire_building */
-      if (circ->purpose != CIRCUIT_PURPOSE_PATH_BIAS_TESTING)
+      if (circ->purpose != CIRCUIT_PURPOSE_PATH_BIAS_TESTING) {
+        tor_trace(TR_SUBSYS(circuit), TR_EV(idle_timeout),
+                  TO_ORIGIN_CIRCUIT(circ));
         circuit_mark_for_close(circ, END_CIRC_REASON_FINISHED);
+      }
     } else if (!circ->timestamp_dirty && circ->state == CIRCUIT_STATE_OPEN) {
       if (timercmp(&circ->timestamp_began, &cutoff, OP_LT)) {
         if (circ->purpose == CIRCUIT_PURPOSE_C_GENERAL ||
@@ -1520,6 +1527,8 @@ circuit_expire_old_circuits_clientside(void)
                     " that has been unused for %ld msec.",
                    TO_ORIGIN_CIRCUIT(circ)->global_identifier,
                    tv_mdiff(&circ->timestamp_began, &now));
+          tor_trace(TR_SUBSYS(circuit), TR_EV(idle_timeout),
+                    TO_ORIGIN_CIRCUIT(circ));
           circuit_mark_for_close(circ, END_CIRC_REASON_FINISHED);
         } else if (!TO_ORIGIN_CIRCUIT(circ)->is_ancient) {
           /* Server-side rend joined circuits can end up really old, because
@@ -1642,11 +1651,12 @@ static void
 circuit_testing_opened(origin_circuit_t *circ)
 {
   if (have_performed_bandwidth_test ||
-      !router_all_orports_seem_reachable(get_options())) {
+      !router_orport_seems_reachable(get_options(), AF_INET)) {
     /* either we've already done everything we want with testing circuits,
-     * or this testing circuit became open due to a fluke, e.g. we picked
-     * a last hop where we already had the connection open due to an
-     * outgoing local circuit. */
+     * OR this IPv4 testing circuit became open due to a fluke, e.g. we picked
+     * a last hop where we already had the connection open due to a
+     * outgoing local circuit, OR this is an IPv6 self-test circuit, not
+     * a bandwidth test circuit. */
     circuit_mark_for_close(TO_CIRCUIT(circ), END_CIRC_AT_ORIGIN);
   } else if (circuit_enough_testing_circs()) {
     router_perform_bandwidth_test(NUM_PARALLEL_TESTING_CIRCS, time(NULL));
@@ -1682,6 +1692,7 @@ circuit_testing_failed(origin_circuit_t *circ, int at_last_hop)
 void
 circuit_has_opened(origin_circuit_t *circ)
 {
+  tor_trace(TR_SUBSYS(circuit), TR_EV(opened), circ);
   circuit_event_status(circ, CIRC_EVENT_BUILT, 0);
 
   /* Remember that this circuit has finished building. Now if we start
@@ -1847,7 +1858,7 @@ circuit_build_failed(origin_circuit_t *circ)
                "from the first hop (%s). I'm going to try to rotate to a "
                "better connection.",
                TO_CIRCUIT(circ)->n_circ_id, circ->global_identifier,
-               channel_get_canonical_remote_descr(n_chan));
+               channel_describe_peer(n_chan));
       n_chan->is_bad_for_new_circs = 1;
     } else {
       log_info(LD_OR,
@@ -2203,6 +2214,8 @@ circuit_launch_by_extend_info(uint8_t purpose,
           tor_fragile_assert();
           return NULL;
       }
+
+      tor_trace(TR_SUBSYS(circuit), TR_EV(cannibalized), circ);
       return circ;
     }
   }
@@ -3134,6 +3147,8 @@ circuit_change_purpose(circuit_t *circ, uint8_t new_purpose)
 
   old_purpose = circ->purpose;
   circ->purpose = new_purpose;
+  tor_trace(TR_SUBSYS(circuit), TR_EV(change_purpose), circ, old_purpose,
+            new_purpose);
 
   if (CIRCUIT_IS_ORIGIN(circ)) {
     control_event_circuit_purpose_changed(TO_ORIGIN_CIRCUIT(circ),

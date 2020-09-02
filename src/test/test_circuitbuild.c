@@ -824,16 +824,14 @@ test_circuit_extend_lspec_valid(void *arg)
   tor_free(p_chan);
 }
 
-#define NODE_SET_IPV4(node, ipv4_addr, ipv4_port) { \
-    tor_addr_t addr; \
-    tor_addr_parse(&addr, ipv4_addr); \
-    node->ri->addr = tor_addr_to_ipv4h(&addr); \
-    node->ri->or_port = ipv4_port; \
+#define NODE_SET_IPV4(node, ipv4_addr_str, ipv4_port) { \
+    tor_addr_parse(&node->ri->ipv4_addr, ipv4_addr_str); \
+    node->ri->ipv4_orport = ipv4_port; \
   }
 
 #define NODE_CLEAR_IPV4(node) { \
-    node->ri->addr = 0; \
-    node->ri->or_port = 0; \
+    tor_addr_make_unspec(&node->ri->ipv4_addr); \
+    node->ri->ipv4_orport = 0; \
   }
 
 #define NODE_SET_IPV6(node, ipv6_addr_str, ipv6_port) { \
@@ -864,7 +862,7 @@ test_circuit_extend_add_ip(void *arg)
 
   /* Do the IPv4 test */
   tt_int_op(circuit_extend_add_ipv4_helper(ec), OP_EQ, 0);
-  tor_addr_from_ipv4h(&ipv4_tmp, fake_node->ri->addr);
+  tor_addr_copy(&ipv4_tmp, &fake_node->ri->ipv4_addr);
   /* The IPv4 should match */
   tt_int_op(tor_addr_compare(&ec->orport_ipv4.addr, &ipv4_tmp, CMP_SEMANTIC),
             OP_EQ, 0);
@@ -1001,15 +999,9 @@ mock_circuit_mark_for_close_(circuit_t *circ, int reason,
 static int mock_channel_connect_calls = 0;
 static channel_t *mock_channel_connect_nchan = NULL;
 static channel_t *
-mock_channel_connect_for_circuit(const tor_addr_t *addr,
-                                 uint16_t port,
-                                 const char *id_digest,
-                                 const struct ed25519_public_key_t *ed_id)
+mock_channel_connect_for_circuit(const extend_info_t *ei)
 {
-  (void)addr;
-  (void)port;
-  (void)id_digest;
-  (void)ed_id;
+  (void)ei;
   mock_channel_connect_calls++;
   return mock_channel_connect_nchan;
 }
@@ -1294,7 +1286,7 @@ test_circuit_extend(void *arg)
   MOCK(server_mode, mock_server_mode);
 
   /* Mock a debug function, but otherwise ignore it */
-  MOCK(channel_get_canonical_remote_descr,
+  MOCK(channel_describe_peer,
        mock_channel_get_canonical_remote_descr);
 
   setup_full_capture_of_logs(LOG_INFO);
@@ -1487,7 +1479,7 @@ test_circuit_extend(void *arg)
   UNMOCK(server_mode);
   server = 0;
 
-  UNMOCK(channel_get_canonical_remote_descr);
+  UNMOCK(channel_describe_peer);
 
   UNMOCK(extend_cell_parse);
   memset(&mock_extend_cell_parse_cell_out, 0,
@@ -1683,14 +1675,14 @@ test_circuit_send_next_onion_skin(void *arg)
 
   extend_info_t ipv6_hop;
   memset(&ipv6_hop, 0, sizeof(ipv6_hop));
-  tor_addr_make_null(&ipv6_hop.addr, AF_INET6);
+  tor_addr_parse(&ipv6_hop.orports[0].addr, "1::2");
   extend_info_t *multi_ipv6_hop[DEFAULT_ROUTE_LEN] = {&ipv6_hop,
                                                       &ipv6_hop,
                                                       &ipv6_hop};
 
   extend_info_t ipv4_hop;
   memset(&ipv4_hop, 0, sizeof(ipv4_hop));
-  tor_addr_make_null(&ipv4_hop.addr, AF_INET);
+  tor_addr_from_ipv4h(&ipv4_hop.orports[0].addr, 0x20304050);
   extend_info_t *multi_ipv4_hop[DEFAULT_ROUTE_LEN] = {&ipv4_hop,
                                                       &ipv4_hop,
                                                       &ipv4_hop};
@@ -1743,7 +1735,7 @@ test_circuit_send_next_onion_skin(void *arg)
   /* Fail because the address family is invalid */
   tt_int_op(circuit_send_next_onion_skin(origin_circ), OP_EQ,
             -END_CIRC_REASON_INTERNAL);
-  expect_log_msg("Client trying to extend to a non-IPv4 address.\n");
+  expect_log_msg("No supported address family found in extend_info.\n");
   mock_clean_saved_logs();
 
   /* Try an extend, but fail the server valid address check */
@@ -1757,7 +1749,7 @@ test_circuit_send_next_onion_skin(void *arg)
   mock_circuit_deliver_create_cell_expect_direct = false;
   tt_int_op(circuit_send_next_onion_skin(origin_circ), OP_EQ,
             -END_CIRC_REASON_INTERNAL);
-  expect_log_msg("Server trying to extend to an invalid address family.\n");
+  expect_log_msg("No supported address family found in extend_info.\n");
   mock_clean_saved_logs();
 
   /* Try an extend, but fail in the client code, with an IPv6 address */
@@ -1771,7 +1763,7 @@ test_circuit_send_next_onion_skin(void *arg)
   mock_circuit_deliver_create_cell_expect_direct = false;
   tt_int_op(circuit_send_next_onion_skin(origin_circ), OP_EQ,
             -END_CIRC_REASON_INTERNAL);
-  expect_log_msg("Client trying to extend to a non-IPv4 address.\n");
+  expect_log_msg("No supported address family found in extend_info.\n");
   mock_clean_saved_logs();
 
   /* Stop capturing bugs, but keep capturing logs */

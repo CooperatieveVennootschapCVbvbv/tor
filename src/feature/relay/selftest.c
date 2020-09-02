@@ -24,6 +24,7 @@
 #include "core/or/circuitlist.h"
 #include "core/or/circuituse.h"
 #include "core/or/crypt_path_st.h"
+#include "core/or/extendinfo.h"
 #include "core/or/extend_info_st.h"
 #include "core/or/origin_circuit_st.h"
 #include "core/or/relay.h"
@@ -56,11 +57,24 @@ static bool can_reach_or_port_ipv6 = false;
 /** Whether we can reach our DirPort from the outside. */
 static bool can_reach_dir_port = false;
 
+/** Has informed_testing_reachable logged a message about testing our IPv4
+ * ORPort? */
+static bool have_informed_testing_or_port_ipv4 = false;
+/** Has informed_testing_reachable logged a message about testing our IPv6
+ * ORPort? */
+static bool have_informed_testing_or_port_ipv6 = false;
+/** Has informed_testing_reachable logged a message about testing our
+ * DirPort? */
+static bool have_informed_testing_dir_port = false;
+
 /** Forget what we have learned about our reachability status. */
 void
 router_reset_reachability(void)
 {
   can_reach_or_port_ipv4 = can_reach_or_port_ipv6 = can_reach_dir_port = false;
+  have_informed_testing_or_port_ipv4 =
+    have_informed_testing_or_port_ipv6 =
+    have_informed_testing_dir_port = false;
 }
 
 /** Return 1 if we won't do reachability checks, because:
@@ -255,15 +269,13 @@ router_do_orport_reachability_checks(const routerinfo_t *me,
    * be NULL. */
   if (ei) {
     const char *family_name = fmt_af_family(family);
+    const tor_addr_port_t *ap = extend_info_get_orport(ei, family);
     log_info(LD_CIRC, "Testing %s of my %s ORPort: %s.",
              !orport_reachable ? "reachability" : "bandwidth",
-             family_name, fmt_addrport(&ei->addr, ei->port));
-    if (!orport_reachable) {
-      /* This is only a 'reachability test' if we don't already think that
-       * the port is reachable.  If we _do_ think it's reachable, then
-       * it counts as a 'bandwidth test'. */
-      inform_testing_reachability(&ei->addr, ei->port, false);
-    }
+             family_name, fmt_addrport_ap(ap));
+
+    inform_testing_reachability(&ap->addr, ap->port, false);
+
     circuit_launch_by_extend_info(CIRCUIT_PURPOSE_TESTING, ei,
                                   CIRCLAUNCH_NEED_CAPACITY|
                                   CIRCLAUNCH_IS_INTERNAL|
@@ -282,8 +294,8 @@ static void
 router_do_dirport_reachability_checks(const routerinfo_t *me)
 {
   tor_addr_port_t my_dirport;
-  tor_addr_from_ipv4h(&my_dirport.addr, me->addr);
-  my_dirport.port = me->dir_port;
+  tor_addr_copy(&my_dirport.addr, &me->ipv4_addr);
+  my_dirport.port = me->ipv4_dirport;
 
   /* If there is already a pending connection, don't open another one. */
   if (!connection_get_by_type_addr_port_purpose(
@@ -347,10 +359,13 @@ router_do_reachability_checks(int test_or, int test_dir)
 }
 
 /** Log a message informing the user that we are testing a port for
- * reachability.
+ * reachability, if we have not already logged such a message.
  *
  * If @a is_dirport is true, then the port is a DirPort; otherwise it is an
- * ORPort. */
+ * ORPort.
+ *
+ * Calls to router_reset_reachability() will reset our view of whether we have
+ * logged this message for a given port. */
 static void
 inform_testing_reachability(const tor_addr_t *addr,
                             uint16_t port,
@@ -358,6 +373,21 @@ inform_testing_reachability(const tor_addr_t *addr,
 {
   if (!router_get_my_routerinfo())
     return;
+
+  bool *have_informed_ptr;
+  if (is_dirport) {
+    have_informed_ptr = &have_informed_testing_dir_port;
+  } else if (tor_addr_family(addr) == AF_INET) {
+    have_informed_ptr = &have_informed_testing_or_port_ipv4;
+  } else {
+    have_informed_ptr = &have_informed_testing_or_port_ipv6;
+  }
+
+  if (*have_informed_ptr) {
+    /* We already told the user that we're testing this port; no need to
+     * do it again. */
+    return;
+  }
 
   char addr_buf[TOR_ADDRPORT_BUF_LEN];
   strlcpy(addr_buf, fmt_addrport(addr, port), sizeof(addr_buf));
@@ -375,6 +405,8 @@ inform_testing_reachability(const tor_addr_t *addr,
              "messages indicating success)",
              afname, port_type, addr_buf,
              TIMEOUT_UNTIL_UNREACHABILITY_COMPLAINT/60);
+
+  *have_informed_ptr = true;
 }
 
 /**
@@ -396,6 +428,7 @@ router_orport_found_reachable(int family)
 {
   const routerinfo_t *me = router_get_my_routerinfo();
   const or_options_t *options = get_options();
+  const char *reachable_reason = "ORPort found reachable";
   bool *can_reach_ptr;
   if (family == AF_INET) {
     can_reach_ptr = &can_reach_or_port_ipv4;
@@ -420,7 +453,13 @@ router_orport_found_reachable(int family)
                ready_to_publish(options) ?
                " Publishing server descriptor." : "");
 
-    mark_my_descriptor_dirty("ORPort found reachable");
+    /* Make sure our descriptor is marked to publish the IPv6 if it is now
+     * reachable. This can change at runtime. */
+    if (family == AF_INET6) {
+      mark_my_descriptor_if_omit_ipv6_changes(reachable_reason, false);
+    } else {
+      mark_my_descriptor_dirty(reachable_reason);
+    }
     /* This is a significant enough change to upload immediately,
      * at least in a test network */
     if (options->TestingTorNetwork == 1) {
@@ -441,7 +480,7 @@ router_dirport_found_reachable(void)
   const or_options_t *options = get_options();
 
   if (!can_reach_dir_port && me) {
-    char *address = tor_dup_ip(me->addr);
+    char *address = tor_addr_to_str_dup(&me->ipv4_addr);
 
     if (!address)
       return;
@@ -452,7 +491,7 @@ router_dirport_found_reachable(void)
                ready_to_publish(options) ?
                " Publishing server descriptor." : "");
 
-    if (router_should_advertise_dirport(options, me->dir_port)) {
+    if (router_should_advertise_dirport(options, me->ipv4_dirport)) {
       mark_my_descriptor_dirty("DirPort found reachable");
       /* This is a significant enough change to upload immediately,
        * at least in a test network */
@@ -462,7 +501,7 @@ router_dirport_found_reachable(void)
     }
     control_event_server_status(LOG_NOTICE,
                                 "REACHABILITY_SUCCEEDED DIRADDRESS=%s:%d",
-                                address, me->dir_port);
+                                address, me->ipv4_dirport);
     tor_free(address);
   }
 }

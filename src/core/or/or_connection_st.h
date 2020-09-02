@@ -49,10 +49,19 @@ struct or_connection_t {
   /* Channel using this connection */
   channel_tls_t *chan;
 
-  tor_addr_t real_addr; /**< The actual address that this connection came from
-                       * or went to.  The <b>addr</b> field is prone to
-                       * getting overridden by the address from the router
-                       * descriptor matching <b>identity_digest</b>. */
+  /**
+   * The "canonical" address and port for this relay's ORPort, if this is
+   * a known relay.
+   *
+   * An ORPort is "canonical" in this sense only if it is the same ORPort
+   * that is listed for this identity in the consensus we have.
+   *
+   * This field may be set on outbound connections for _any_ relay, and on
+   * inbound connections after authentication.  If we don't know the relay's
+   * identity, or if we don't have the relay's identity in our consensus, we
+   * leave this address as UNSPEC.
+   **/
+  tor_addr_port_t canonical_orport;
 
   /** Should this connection be used for extending circuits to the server
    * matching the <b>identity_digest</b> field?  Set to true if we're pretty

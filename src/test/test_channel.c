@@ -16,6 +16,10 @@
 /* For packed_cell stuff */
 #define RELAY_PRIVATE
 #include "core/or/relay.h"
+/* For channel_tls_t object and private functions. */
+#define CHANNEL_OBJECT_PRIVATE
+#define CHANNELTLS_PRIVATE
+#include "core/or/channeltls.h"
 /* For init/free stuff */
 #include "core/or/scheduler.h"
 #include "feature/nodelist/networkstatus.h"
@@ -25,6 +29,8 @@
 #include "core/or/origin_circuit_st.h"
 #include "feature/nodelist/routerstatus_st.h"
 #include "core/or/var_cell_st.h"
+#include "core/or/or_connection_st.h"
+#include "lib/net/inaddr.h"
 
 /* Test suite stuff */
 #include "test/log_test_helpers.h"
@@ -44,7 +50,6 @@ static int dump_statistics_mock_matches = 0;
 static int test_close_called = 0;
 static int test_chan_should_be_canonical = 0;
 static int test_chan_should_match_target = 0;
-static int test_chan_canonical_should_be_reliable = 0;
 static int test_chan_listener_close_fn_called = 0;
 static int test_chan_listener_fn_called = 0;
 
@@ -157,13 +162,20 @@ chan_test_finish_close(channel_t *ch)
 }
 
 static const char *
-chan_test_get_remote_descr(channel_t *ch, int flags)
+chan_test_describe_peer(const channel_t *ch)
 {
   tt_assert(ch);
-  tt_int_op(flags & ~(GRD_FLAG_ORIGINAL | GRD_FLAG_ADDR_ONLY), OP_EQ, 0);
 
  done:
   return "Fake channel for unit tests; no real endpoint";
+}
+
+static int
+chan_test_get_remote_addr(const channel_t *ch, tor_addr_t *out)
+{
+  (void)ch;
+  tor_addr_from_ipv4h(out, 0x7f000001);
+  return 1;
 }
 
 static int
@@ -262,7 +274,8 @@ new_fake_channel(void)
 
   chan->close = chan_test_close;
   chan->num_cells_writeable = chan_test_num_cells_writeable;
-  chan->get_remote_descr = chan_test_get_remote_descr;
+  chan->describe_peer = chan_test_describe_peer;
+  chan->get_remote_addr = chan_test_get_remote_addr;
   chan->write_packed_cell = chan_test_write_packed_cell;
   chan->write_var_cell = chan_test_write_var_cell;
   chan->state = CHANNEL_STATE_OPEN;
@@ -337,13 +350,9 @@ scheduler_release_channel_mock(channel_t *ch)
 }
 
 static int
-test_chan_is_canonical(channel_t *chan, int req)
+test_chan_is_canonical(channel_t *chan)
 {
   tor_assert(chan);
-
-  if (req && test_chan_canonical_should_be_reliable) {
-    return 1;
-  }
 
   if (test_chan_should_be_canonical) {
     return 1;
@@ -1360,6 +1369,9 @@ test_channel_for_extend(void *arg)
   /* Make it older than chan1. */
   chan2->timestamp_created = chan1->timestamp_created - 1;
 
+  /* Say it's all canonical. */
+  test_chan_should_be_canonical = 1;
+
   /* Set channel identities and add it to the channel map. The last one to be
    * added is made the first one in the list so the lookup will always return
    * that one first. */
@@ -1463,8 +1475,8 @@ test_channel_for_extend(void *arg)
   chan2->is_bad_for_new_circs = 0;
 
   /* Non canonical channels. */
+  test_chan_should_be_canonical = 0;
   test_chan_should_match_target = 0;
-  test_chan_canonical_should_be_reliable = 1;
   ret_chan = channel_get_for_extend(digest, &ed_id, &ipv4_addr, &ipv6_addr,
                                     &msg, &launch);
   tt_assert(!ret_chan);
@@ -1537,6 +1549,54 @@ test_channel_listener(void *arg)
   channel_free_all();
 }
 
+#define TEST_SETUP_MATCHES_ADDR(orcon, addr, src, rv) STMT_BEGIN \
+    rv = tor_inet_pton(addr.family, src, &addr.addr); \
+    tt_int_op(rv, OP_EQ, 1); \
+    orcon->base_.addr = addr; \
+  STMT_END;
+
+#define TEST_MATCHES_ADDR(chan, addr4, addr6, rv, exp) STMT_BEGIN       \
+    rv = channel_matches_target_addr_for_extend(chan, addr4, addr6);    \
+    tt_int_op(rv, OP_EQ, exp); \
+  STMT_END;
+
+static void
+test_channel_matches_target_addr_for_extend(void *arg)
+{
+  (void) arg;
+
+  channel_tls_t *tlschan = tor_malloc_zero(sizeof(*tlschan));
+  or_connection_t *orcon = tor_malloc_zero(sizeof(*orcon));
+  channel_t *chan = &(tlschan->base_);
+  tor_addr_t addr;
+  int rv;
+
+  tlschan->conn = orcon;
+  channel_tls_common_init(tlschan);
+
+  /* Test for IPv4 addresses. */
+  addr.family = AF_INET;
+  TEST_SETUP_MATCHES_ADDR(orcon, addr, "1.2.3.4", rv);
+  TEST_MATCHES_ADDR(chan, &addr, NULL, rv, 1);
+
+  tor_inet_pton(addr.family, "2.5.3.4", &addr.addr);
+  TEST_MATCHES_ADDR(chan, &addr, NULL, rv, 0);
+
+  /* Test for IPv6 addresses. */
+  addr.family = AF_INET6;
+  TEST_SETUP_MATCHES_ADDR(orcon, addr, "3:4:7:1:9:8:09:10", rv);
+  TEST_MATCHES_ADDR(chan, NULL, &addr, rv, 1);
+
+  tor_inet_pton(addr.family, "::", &addr.addr);
+  TEST_MATCHES_ADDR(chan, NULL, &addr, rv, 0);
+
+ done:
+  circuitmux_clear_policy(chan->cmux);
+  circuitmux_free(chan->cmux);
+  tor_free(orcon);
+  tor_free(tlschan);
+}
+
 struct testcase_t channel_tests[] = {
   { "inbound_cell", test_channel_inbound_cell, TT_FORK,
     NULL, NULL },
@@ -1557,6 +1617,8 @@ struct testcase_t channel_tests[] = {
   { "get_channel_for_extend", test_channel_for_extend, TT_FORK,
     NULL, NULL },
   { "listener", test_channel_listener, TT_FORK,
+    NULL, NULL },
+  { "matches_target", test_channel_matches_target_addr_for_extend, TT_FORK,
     NULL, NULL },
   END_OF_TESTCASES
 };

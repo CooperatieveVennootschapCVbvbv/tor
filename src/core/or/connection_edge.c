@@ -70,6 +70,7 @@
 #include "core/or/circuitpadding.h"
 #include "core/or/connection_edge.h"
 #include "core/or/connection_or.h"
+#include "core/or/extendinfo.h"
 #include "core/or/policies.h"
 #include "core/or/reasons.h"
 #include "core/or/relay.h"
@@ -165,8 +166,12 @@ static int connection_exit_connect_dir(edge_connection_t *exitconn);
 static int consider_plaintext_ports(entry_connection_t *conn, uint16_t port);
 static int connection_ap_supports_optimistic_data(const entry_connection_t *);
 
-/** Convert a connection_t* to an edge_connection_t*; assert if the cast is
- * invalid. */
+/**
+ * Cast a `connection_t *` to an `edge_connection_t *`.
+ *
+ * Exit with an assertion failure if the input is not an
+ * `edge_connection_t`.
+ **/
 edge_connection_t *
 TO_EDGE_CONN(connection_t *c)
 {
@@ -175,6 +180,24 @@ TO_EDGE_CONN(connection_t *c)
   return DOWNCAST(edge_connection_t, c);
 }
 
+/**
+ * Cast a `const connection_t *` to a `const edge_connection_t *`.
+ *
+ * Exit with an assertion failure if the input is not an
+ * `edge_connection_t`.
+ **/
+const edge_connection_t *
+CONST_TO_EDGE_CONN(const connection_t *c)
+{
+  return TO_EDGE_CONN((connection_t *)c);
+}
+
+/**
+ * Cast a `connection_t *` to an `entry_connection_t *`.
+ *
+ * Exit with an assertion failure if the input is not an
+ * `entry_connection_t`.
+ **/
 entry_connection_t *
 TO_ENTRY_CONN(connection_t *c)
 {
@@ -182,11 +205,41 @@ TO_ENTRY_CONN(connection_t *c)
   return (entry_connection_t*) SUBTYPE_P(c, entry_connection_t, edge_.base_);
 }
 
+/**
+ * Cast a `const connection_t *` to a `const entry_connection_t *`.
+ *
+ * Exit with an assertion failure if the input is not an
+ * `entry_connection_t`.
+ **/
+const entry_connection_t *
+CONST_TO_ENTRY_CONN(const connection_t *c)
+{
+  return TO_ENTRY_CONN((connection_t*) c);
+}
+
+/**
+ * Cast an `edge_connection_t *` to an `entry_connection_t *`.
+ *
+ * Exit with an assertion failure if the input is not an
+ * `entry_connection_t`.
+ **/
 entry_connection_t *
 EDGE_TO_ENTRY_CONN(edge_connection_t *c)
 {
   tor_assert(c->base_.magic == ENTRY_CONNECTION_MAGIC);
   return (entry_connection_t*) SUBTYPE_P(c, entry_connection_t, edge_);
+}
+
+/**
+ * Cast a `const edge_connection_t *` to a `const entry_connection_t *`.
+ *
+ * Exit with an assertion failure if the input is not an
+ * `entry_connection_t`.
+ **/
+const entry_connection_t *
+CONST_EDGE_TO_ENTRY_CONN(const edge_connection_t *c)
+{
+  return EDGE_TO_ENTRY_CONN((edge_connection_t*)c);
 }
 
 /** An AP stream has failed/finished. If it hasn't already sent back
@@ -423,9 +476,7 @@ warn_if_hs_unreachable(const edge_connection_t *conn, uint8_t reason)
     char *m;
     if ((m = rate_limit_log(&warn_limit, approx_time()))) {
       log_warn(LD_EDGE, "Onion service connection to %s failed (%s)",
-               (conn->base_.socket_family == AF_UNIX) ?
-               safe_str(conn->base_.address) :
-               safe_str(fmt_addrport(&conn->base_.addr, conn->base_.port)),
+               connection_describe_peer(TO_CONN(conn)),
                stream_end_reason_to_string(reason));
       tor_free(m);
     }
@@ -921,9 +972,8 @@ connection_edge_finished_connecting(edge_connection_t *edge_conn)
   conn = TO_CONN(edge_conn);
   tor_assert(conn->state == EXIT_CONN_STATE_CONNECTING);
 
-  log_info(LD_EXIT,"Exit connection to %s:%u (%s) established.",
-           escaped_safe_str(conn->address), conn->port,
-           safe_str(fmt_and_decorate_addr(&conn->addr)));
+  log_info(LD_EXIT,"%s established.",
+           connection_describe(conn));
 
   rep_hist_note_exit_stream_opened(conn->port);
 
@@ -1444,8 +1494,8 @@ connection_ap_fail_onehop(const char *failed_digest,
         continue;
       }
       if (tor_addr_parse(&addr, entry_conn->socks_request->address)<0 ||
-          !tor_addr_eq(&build_state->chosen_exit->addr, &addr) ||
-          build_state->chosen_exit->port != entry_conn->socks_request->port)
+          !extend_info_has_orport(build_state->chosen_exit, &addr,
+                                  entry_conn->socks_request->port))
         continue;
     }
     log_info(LD_APP, "Closing one-hop stream to '%s/%s' because the OR conn "
@@ -1503,6 +1553,16 @@ circuit_discard_optional_exit_enclaves(extend_info_t *info)
   } SMARTLIST_FOREACH_END(conn);
 }
 
+/** Set the connection state to CONTROLLER_WAIT and send an control port event.
+ */
+void
+connection_entry_set_controller_wait(entry_connection_t *conn)
+{
+  CONNECTION_AP_EXPECT_NONPENDING(conn);
+  ENTRY_TO_CONN(conn)->state = AP_CONN_STATE_CONTROLLER_WAIT;
+  control_event_stream_status(conn, STREAM_EVENT_CONTROLLER_WAIT, 0);
+}
+
 /** The AP connection <b>conn</b> has just failed while attaching or
  * sending a BEGIN or resolving on <b>circ</b>, but another circuit
  * might work. Detach the circuit, and either reattach it, launch a
@@ -1534,8 +1594,7 @@ connection_ap_detach_retriable(entry_connection_t *conn,
     circuit_detach_stream(TO_CIRCUIT(circ),ENTRY_TO_EDGE_CONN(conn));
     connection_ap_mark_as_pending_circuit(conn);
   } else {
-    CONNECTION_AP_EXPECT_NONPENDING(conn);
-    ENTRY_TO_CONN(conn)->state = AP_CONN_STATE_CONTROLLER_WAIT;
+    connection_entry_set_controller_wait(conn);
     circuit_detach_stream(TO_CIRCUIT(circ),ENTRY_TO_EDGE_CONN(conn));
   }
   return 0;
@@ -1663,6 +1722,9 @@ parse_extended_hostname(char *address, hostname_type_t *type_out)
   log_warn(LD_APP, "Invalid %shostname %s; rejecting",
            is_onion ? "onion " : "",
            safe_str_client(address));
+  if (*type_out == ONION_V3_HOSTNAME) {
+      *type_out = BAD_HOSTNAME;
+  }
   return false;
 }
 
@@ -1685,8 +1747,7 @@ connection_ap_rewrite_and_attach_if_allowed,(entry_connection_t *conn,
   const or_options_t *options = get_options();
 
   if (options->LeaveStreamsUnattached) {
-    CONNECTION_AP_EXPECT_NONPENDING(conn);
-    ENTRY_TO_CONN(conn)->state = AP_CONN_STATE_CONTROLLER_WAIT;
+    connection_entry_set_controller_wait(conn);
     return 0;
   }
   return connection_ap_handshake_rewrite_and_attach(conn, circ, cpath);
@@ -2139,7 +2200,7 @@ connection_ap_handshake_rewrite_and_attach(entry_connection_t *conn,
   if (!parse_extended_hostname(socks->address, &addresstype)) {
     control_event_client_status(LOG_WARN, "SOCKS_BAD_HOSTNAME HOSTNAME=%s",
                                 escaped(socks->address));
-    if (addresstype == ONION_V3_HOSTNAME) {
+    if (addresstype == BAD_HOSTNAME) {
       conn->socks_request->socks_extended_error_code = SOCKS5_HS_BAD_ADDRESS;
     }
     connection_mark_unattached_ap(conn, END_STREAM_REASON_TORPROTOCOL);
@@ -3836,8 +3897,8 @@ handle_hs_exit_conn(circuit_t *circ, edge_connection_t *conn)
     return -1;
   }
   if (ret < 0) {
-    log_info(LD_REND, "Didn't find rendezvous service (addr%s, port %d)",
-             fmt_addr(&TO_CONN(conn)->addr), TO_CONN(conn)->port);
+    log_info(LD_REND, "Didn't find rendezvous service at %s",
+             connection_describe_peer(TO_CONN(conn)));
     /* Send back reason DONE because we want to make hidden service port
      * scanning harder thus instead of returning that the exit policy
      * didn't match, which makes it obvious that the port is closed,
@@ -3972,7 +4033,7 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
          * proxies. */
         log_fn(LOG_PROTOCOL_WARN, LD_PROTOCOL,
                "Attempt by %s to open a stream %s. Closing.",
-               safe_str(channel_get_canonical_remote_descr(or_circ->p_chan)),
+               safe_str(channel_describe_peer(or_circ->p_chan)),
                client_chan ? "on first hop of circuit" :
                              "from unknown relay");
         relay_send_end_cell_from_edge(rh.stream_id, circ,
@@ -3995,10 +4056,13 @@ connection_exit_begin_conn(cell_t *cell, circuit_t *circ)
      * caller might want to know whether the remote IP address has changed,
      * and we might already have corrected base_.addr[ess] for the relay's
      * canonical IP address. */
-    if (or_circ && or_circ->p_chan)
-      address = tor_strdup(channel_get_actual_remote_address(or_circ->p_chan));
-    else
+    tor_addr_t chan_addr;
+    if (or_circ && or_circ->p_chan &&
+        channel_get_addr_if_possible(or_circ->p_chan, &chan_addr)) {
+      address = tor_addr_to_str_dup(&chan_addr);
+    } else {
       address = tor_strdup("127.0.0.1");
+    }
     port = 1; /* XXXX This value is never actually used anywhere, and there
                * isn't "really" a connection here.  But we
                * need to set it to something nonzero. */
@@ -4188,8 +4252,8 @@ connection_exit_connect(edge_connection_t *edge_conn)
                              &why_failed_exit_policy)) {
     if (BUG(!why_failed_exit_policy))
       why_failed_exit_policy = "";
-    log_info(LD_EXIT,"%s:%d failed exit policy%s. Closing.",
-             escaped_safe_str_client(conn->address), conn->port,
+    log_info(LD_EXIT,"%s failed exit policy%s. Closing.",
+             connection_describe(conn),
              why_failed_exit_policy);
     connection_edge_end(edge_conn, END_STREAM_REASON_EXITPOLICY);
     circuit_detach_stream(circuit_get_by_edge_conn(edge_conn), edge_conn);
